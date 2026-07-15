@@ -47,8 +47,10 @@ RTCZero rtc;
 
 // Handshake Constants
 char cmd = ' ';
-const byte TX_pin = 6;           // serial TX pin
-const byte RX_pin = 7;           // serial RX and "is-wet" test pin
+//const byte TX_pin = 6;           // serial TX pin
+//const byte RX_pin = 7;           // serial RX and "is-wet" test pin
+const byte TX_pin = 1;           // serial TX pin
+const byte RX_pin = 0;           // serial RX and "is-wet" test pin
 const byte service_pin = 8;      // jumper for USB. wont be in production code
 const byte measure_battery = 10; // ADC input from voltage divider for battery test
 
@@ -80,6 +82,11 @@ void setup()
 {
     delay(500); // Settling delay 
 
+    Serial.begin(115200);
+    while(!Serial);
+
+    Serial.println("\r\nPressure logger test");
+
     // Set ALL 10 GPIO pins to INPUT_PULLUP to prevent floating current
     for (int i = 0; i <= 10; i++) 
     {
@@ -97,19 +104,22 @@ void setup()
     pinMode(12, OUTPUT);
     digitalWrite(13, HIGH); // User LED
     pinMode(13, OUTPUT);
+    Serial.println("Onboard LEDs killed");
 
     pinMode(measure_battery, INPUT); 
     pinMode(service_pin, INPUT_PULLUP);
     delay(100);
-
+#if 0
     if (digitalRead(service_pin) == LOW) 
     {
+        Serial.println("Service pin is LOW, attaching to USB");
         USBDevice.attach();
         delay(5000);
     }
     else 
     {
         // Turn off USB and ADC to save power
+        Serial.println("Service pin is HIGH, turning off USB and ADC");
         USBDevice.detach();
         ADC->CTRLA.bit.ENABLE = 0;
         
@@ -118,14 +128,18 @@ void setup()
             // Do nothing, wait for ADC to stop safely
         }
     }
+#endif
+    Serial.println("USB and ADC setup done");
 
     // 1. Initialize core communication buses first
     Wire.begin();
     Wire.setClock(400000); // Fast I2C reduces CPU "on time"
     delay(10);
+    Serial.println("I2C Wire setup done");
 
     // 2. Initialize the RTC library to establish baseline settings
     rtc.begin(); 
+    Serial.println("RTC setup done");
 
     // 3. SAFE BITWISE OVERRIDES: Keep external crystal active during sleep
     SYSCTRL->XOSC32K.reg |= SYSCTRL_XOSC32K_RUNSTDBY;
@@ -135,6 +149,7 @@ void setup()
     {
         // Do nothing, wait for crystal to stabilize
     }
+    Serial.println("External crystal setup done");
 
     // 4. Route XOSC32K into GCLK2 and force it to run during sleep
     GCLK->GENDIV.reg = GCLK_GENDIV_ID(2); 
@@ -152,6 +167,7 @@ void setup()
     {
         // Do nothing, wait for final sync
     }
+    Serial.println("GCLK setup done");
 
     // 6. Automatically sync internal time to code compilation time
     struct tm tm_compile;
@@ -179,12 +195,16 @@ void setup()
     {
         recover_fram_address(); 
     }
+    Serial.println("Date/time in FRam setup done");
 
     // 8. Initialize the pressure sensor
+#if 0
     sensor.setModel(MS5837::MS5837_30BA); 
     sensor.setFluidDensity(1029);         
     sensor.init();                        
+    Serial.println("Pressure sensor setup done");
     delay(1000);
+#endif
 
     // 9. DISABLE THE BROWN-OUT DETECTOR FOR MAX SLEEP POWER SAVINGS
     SYSCTRL->BOD33.bit.ENABLE = 0;
@@ -193,30 +213,36 @@ void setup()
     {
         // Do nothing, wait for BOD33 to safely turn off completely
     }
+    Serial.println("Brownout detection setup done");
 
     // 10. Enable system Watchdog safety right before loop execution begins
     Watchdog.enable(16384);
+    Serial.println("Watchdog setup done");
     
   // --- TEMPORARY DESK TESTING ONLY ---
   // This will overwrite your memory with fake data every time it boots.
   // Comment this out before your real deployment
   inject_test_data();
+  Serial.println("Setup function done");
 }
 /*********************************************************************************/
 
 void loop()
 {
   Watchdog.reset();
+  Serial.println("\r\nPressure logger loop");
 
   // --- Read sensor once per wake cycle ---
-  sensor.read();
-  uint16_t initial_pressure = (uint16_t)sensor.pressure();
+  //sensor.read();
+  //uint16_t initial_pressure = (uint16_t)sensor.pressure();
+  uint16_t initial_pressure = 1500;
   // --- UART wake detection 
   pinMode(RX_pin, INPUT_PULLDOWN);
   delayMicroseconds(300);
 
   if (digitalRead(RX_pin) == HIGH)
   {
+    Serial.println("Switching to UART mode");
     // Now switch to UART mode
     pinMode(TX_pin, OUTPUT);
     pinMode(RX_pin, INPUT);
@@ -229,6 +255,7 @@ void loop()
     pinMode(RX_pin, INPUT);
     return;
   }
+  Serial.println("Not switching to UART mode");
 
   // --- Validate pressure reading ---
   bool valid_pressure = true;
@@ -247,6 +274,7 @@ void loop()
 
   if (!valid_pressure)
   {
+    Serial.println("Pressure not valid, sleeping");
     sleepDuration = 5;
     go_to_sleep(sleepDuration);
     return;
@@ -259,6 +287,7 @@ void loop()
   {
   case READ_SENSOR:
   {
+    Serial.println("Handling READ_SENSOR state");
     if (initial_pressure >= 2000)
     {
       handle_active_deployment(initial_pressure);
@@ -275,6 +304,7 @@ void loop()
 
   case SLEEP_MODE:
   {
+    Serial.println("Handling SLEEP_MODE state");
     pinMode(RX_pin, INPUT);
     pinMode(TX_pin, INPUT);
 
@@ -284,6 +314,7 @@ void loop()
   }
 
   default:
+    Serial.println("Handling default state");
     currentState = READ_SENSOR;
     break;
   }
@@ -639,6 +670,7 @@ uint16_t crc16_update(uint16_t crc, uint8_t data)
 /*******************************************************/
 void go_to_sleep(uint32_t seconds)
 {
+#if 0
   // 1. Calculate the exact second to wake up
   uint32_t alarm_time = rtc.getEpoch() + seconds;
   rtc.setAlarmEpoch(alarm_time);
@@ -649,6 +681,8 @@ void go_to_sleep(uint32_t seconds)
   // 3. Enter deepest sleep mode (~15-40uA)
   // The CPU stops here until the RTC alarm triggers
   rtc.standbyMode();
+#endif
+  delay(seconds);
 }
 
 /****************************************************************************/
@@ -658,7 +692,7 @@ void write_16(uint16_t address, uint16_t value)
   buffer[0] = (uint8_t)(value >> 8);
   buffer[1] = (uint8_t)(value & 0xFF);
 
-  fram.write(address, buffer, 2);
+  //fram.write(address, buffer, 2);
 }
 
 /****************************************************************************/
@@ -671,7 +705,7 @@ void write_32(uint16_t address, uint32_t value)
   buffer[3] = (uint8_t)(value & 0xFF);
 
   // library's multi-byte write is better for battery than 4 single writes
-  fram.write(address, buffer, 4);
+  //fram.write(address, buffer, 4);
 }
 /******************************************************************************/
 void update_pointer()
@@ -681,12 +715,12 @@ void update_pointer()
   buffer[1] = (uint8_t)(current_address & 0xFF);
 
   // 1. Write to Primary Slot using multi-byte write
-  fram.write(FRAM_POINTER_ADDR, buffer, 2);
+  //fram.write(FRAM_POINTER_ADDR, buffer, 2);
 
   delayMicroseconds(100); // Tiny pause to let the I2C bus rest
 
   // 2. Write to Mirror Slot using multi-byte write
-  fram.write(0x7FFE, buffer, 2);
+  //fram.write(0x7FFE, buffer, 2);
 }
 
 /*************************************************************************************/
@@ -697,11 +731,15 @@ void recover_fram_address()
   uint8_t buffer[2];
 
   // 2. Safely grab Primary Pointer
-  fram.read(FRAM_POINTER_ADDR, buffer, 2);
+  //fram.read(FRAM_POINTER_ADDR, buffer, 2);
+  buffer[0] = FRAM_POINTER_ADDR >> 8;
+  buffer[1] = FRAM_POINTER_ADDR & 0xff;
   uint16_t primary = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // 3. Safely grab Mirror Pointer
-  fram.read(0x7FFE, buffer, 2);
+  //fram.read(0x7FFE, buffer, 2);
+  buffer[0] = 0x7FFE >> 8;
+  buffer[1] = 0x7FFE & 0xff;
   uint16_t mirror = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // Helper lambda to validate a pointer
