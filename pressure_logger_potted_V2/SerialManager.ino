@@ -15,18 +15,23 @@ bool handle_uart()
   switch (uartState)
   {
     case UartState::CLEAN_COMM:
+      SERIAL_LOG("CLEAN_COMM state");
       handle_uart_clean_comm();
       break;
     case UartState::DETECT_CLIENT:
+      //SERIAL_LOG("DETECT_CLIENT state");
       handle_uart_detect_client();
       break;
     case UartState::CONFIRM_CLIENT:
+      SERIAL_LOG("CONFIRM_CLIENT state");
       handle_uart_confirm_client();
       break;
     case UartState::COMMAND_MODE:
+      SERIAL_LOG("COMMAND_MODE state");
       handle_uart_command_mode();
       break;
     case UartState::CLEANUP_COMM:
+      SERIAL_LOG("CLEANUP_COMM state");
       handle_uart_cleanup_comm();
       break;
   }
@@ -43,32 +48,34 @@ void handle_uart_clean_comm()
   delay(50);
 
   // Clear startup noise
-  while (Serial1.available() > 0)
-  {
-    Serial1.read();
-  }
+  //while (Serial1.available() > 0)
+  //{
+  //  Serial1.read();
+  //}
 
   listen_start = millis();
 
+  SERIAL_LOG("CLEAN_COMM -> DETECT_CLIENT");
   uartState = UartState::DETECT_CLIENT;
 }
 
 void handle_uart_detect_client()
 {
-  uint32_t listen_start = millis();
-  if (millis() - listen_start >= 200)
+  if (millis() - listen_start >= 2000)
     uartState = UartState::CLEANUP_COMM;
     return;
 
-  if (Serial1.available() > 0)
+  while (Serial1.available() > 0)
   {
     cmd = Serial1.read();
+    SERIAL_LOG("Received: " + String(cmd));
 
     if (cmd == 'P')
     {
       Serial1.write('H');
       uartState = UartState::CONFIRM_CLIENT;
       listen_start = millis();
+      break;
     }
   }
 }

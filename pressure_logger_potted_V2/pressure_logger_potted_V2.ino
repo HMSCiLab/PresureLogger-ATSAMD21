@@ -33,6 +33,16 @@ Make sure to change it in setup*/
 #include "PressureSensorManager.h"
 #include "Utilities.h"
 
+// Uncomment this line to add debugging prints.
+#define DEBUG_LOGGING
+#ifdef DEBUG_LOGGING
+#define SERIAL_LOG(x) Serial.println(x)
+#else
+#define SERIAL_LOG(x)
+#endif
+
+// Uncomment this line to exclude code that requires hardware.
+#define DEBUG_NO_HARDWARE
 
 // Define states
 enum DeviceState
@@ -43,7 +53,7 @@ enum DeviceState
   ACTIVE_DEPLOYMENT
 };
 
-DeviceState currentState = CHECK_COMM; // Start here
+DeviceState currentState = READ_SENSOR; // Start here
 
 // Global Objects
 MS5837 sensor;
@@ -52,8 +62,11 @@ RTCZero rtc;
 
 // Handshake Constants
 char cmd = ' ';
-const byte TX_pin = 6;           // serial TX pin
-const byte RX_pin = 7;           // serial RX and "is-wet" test pin
+// Redefine pins for feather.
+//const byte TX_pin = 6;           // serial TX pin
+//const byte RX_pin = 7;           // serial RX and "is-wet" test pin
+const byte TX_pin = 1;           // serial TX pin
+const byte RX_pin = 0;           // serial RX and "is-wet" test pin
 const byte service_pin = 8;      // jumper for USB. wont be in production code
 const byte measure_battery = 10; // ADC input from voltage divider for battery test
 
@@ -75,8 +88,16 @@ void inject_test_data();
 
 void setup() 
 {
+#ifdef DEBUG_LOGGING
+  Serial.begin(115200);
+  while(!Serial);
+#endif
+
+  SERIAL_LOG("SetupIOPins()");
   SetupIOPins();
+  SERIAL_LOG("SetupUsbDevice()");
   SetupUsbDevice();
+  SERIAL_LOG("SetupRtc()");
   SetupRtc();
 
   // 1. Initialize core communication buses first
@@ -91,10 +112,12 @@ void setup()
   }
 
   // 8. Initialize the pressure sensor
+#ifndef DEBUG_NO_HARDWARE
   sensor.setModel(MS5837::MS5837_30BA); 
   sensor.setFluidDensity(1029);         
   sensor.init();                        
   delay(1000);
+#endif
 
   // 9. DISABLE THE BROWN-OUT DETECTOR FOR MAX SLEEP POWER SAVINGS
   SYSCTRL->BOD33.bit.ENABLE = 0;
@@ -111,10 +134,13 @@ void setup()
   // This will overwrite your memory with fake data every time it boots.
   // Comment this out before your real deployment
   inject_test_data();
+  SERIAL_LOG("Setup function done");
 }
 /*********************************************************************************/
 void loop()
 {
+  Watchdog.reset();
+
   switch (currentState)
   {
     case DeviceState::CHECK_COMM:
@@ -123,6 +149,7 @@ void loop()
       break;
 
     case DeviceState::READ_SENSOR:
+      SERIAL_LOG("READ_SENSOR state");
       ReadInitialPressure();
       if (initial_pressure >= 2000)
       {
@@ -138,6 +165,7 @@ void loop()
       break;
 
     case DeviceState::SLEEP_MODE:
+      SERIAL_LOG("SLEEP_MODE state");
       pinMode(RX_pin, INPUT);
       pinMode(TX_pin, INPUT);
 
@@ -146,6 +174,7 @@ void loop()
       break;
 
     case DeviceState::ACTIVE_DEPLOYMENT:
+      SERIAL_LOG("ACTIVE_DEPLOYMENT state");
       // --- Read sensor once per wake cycle ---
       ReadInitialPressure();
       if (!ValidatePressure())
@@ -160,6 +189,7 @@ void loop()
       break;
 
     default:
+      SERIAL_LOG("DEFAULT state");
       currentState = DeviceState::READ_SENSOR;
       break;
   }
@@ -172,8 +202,9 @@ void loop()
 
     if (digitalRead(RX_pin) == HIGH)
     {
+      SERIAL_LOG("UART wake detected");
       // Force UART session on next loop iteration
-      uartState = UartState::CLEANUP_COMM;
+      uartState = UartState::CLEAN_COMM;
       currentState = DeviceState::CHECK_COMM;
     }
   }
@@ -284,6 +315,7 @@ void SetupIOPins()
 /*******************************************************/
 void SetupUsbDevice()
 {
+#ifndef DEBUG_NO_HARDWARE
     if (digitalRead(service_pin) == LOW) 
     {
         USBDevice.attach();
@@ -300,6 +332,7 @@ void SetupUsbDevice()
             // Do nothing, wait for ADC to stop safely
         }
     }
+#endif
 }
 
 /*******************************************************/
@@ -359,6 +392,7 @@ void SetupRtc()
 /*******************************************************/
 void go_to_sleep(uint32_t seconds)
 {
+#ifndef DEBUG_NO_HARDWARE
   // 1. Calculate the exact second to wake up
   uint32_t alarm_time = rtc.getEpoch() + seconds;
   rtc.setAlarmEpoch(alarm_time);
@@ -369,6 +403,9 @@ void go_to_sleep(uint32_t seconds)
   // 3. Enter deepest sleep mode (~15-40uA)
   // The CPU stops here until the RTC alarm triggers
   rtc.standbyMode();
+#else
+  delay(seconds * 1000);
+#endif
 }
 
 /*************************************************************************************/
@@ -379,11 +416,21 @@ void recover_fram_address()
   uint8_t buffer[2];
 
   // 2. Safely grab Primary Pointer
+#ifndef DEBUG_NO_HARDWARE
   fram.read(FRAM_POINTER_ADDR, buffer, 2);
+#else
+  buffer[0] = FRAM_POINTER_ADDR >> 8;
+  buffer[1] = FRAM_POINTER_ADDR & 0xff;
+#endif
   uint16_t primary = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // 3. Safely grab Mirror Pointer
+#ifndef DEBUG_NO_HARDWARE
   fram.read(0x7FFE, buffer, 2);
+#else
+  buffer[0] = 0x7FFE >> 8;
+  buffer[1] = 0x7FFE & 0xff;
+#endif
   uint16_t mirror = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // Helper lambda to validate a pointer
