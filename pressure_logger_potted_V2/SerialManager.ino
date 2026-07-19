@@ -62,8 +62,10 @@ void handle_uart_clean_comm()
 void handle_uart_detect_client()
 {
   if (millis() - listen_start >= 2000)
+  {
     uartState = UartState::CLEANUP_COMM;
     return;
+  }
 
   while (Serial1.available() > 0)
   {
@@ -83,8 +85,10 @@ void handle_uart_detect_client()
 void handle_uart_confirm_client()
 {
   if (millis() - listen_start >= 2000)
+  {
     uartState = UartState::CLEANUP_COMM;
     return;
+  }
 
   if (Serial1.available() > 0)
   {
@@ -102,35 +106,37 @@ void handle_uart_confirm_client()
 void handle_uart_command_mode()
 {
   if (millis() - listen_start >= 10000)
+  {
     uartState = UartState::CLEAN_COMM;
     return;
+  }
 
-    if (Serial1.available() > 0)
+  if (Serial1.available() > 0)
+  {
+    listen_start = millis(); // reset timeout
+    cmd = Serial1.read();
+
+    if (cmd == 'D')
     {
-      listen_start = millis(); // reset timeout
-      cmd = Serial1.read();
-
-      if (cmd == 'D')
-      {
-        dump_data();
-      }
-      else if (cmd == 'A')
-      {
-        Serial1.write('L');
-      }
-      else if (cmd == 'W')
-      {
-        current_address = 2;
-        last_valid_address = 2;
-        fram_wrapped = false;
-        update_pointer();
-        Serial1.print('E');
-      }
-      else if (cmd == 'X')
-      {
-        uartState = UartState::CLEANUP_COMM;
-      }
+      dump_data();
     }
+    else if (cmd == 'A')
+    {
+      Serial1.write('L');
+    }
+    else if (cmd == 'W')
+    {
+      current_address = 2;
+      last_valid_address = 2;
+      fram_wrapped = false;
+      update_pointer();
+      Serial1.print('E');
+    }
+    else if (cmd == 'X')
+    {
+      uartState = UartState::CLEANUP_COMM;
+    }
+  }
 }
 
 void handle_uart_cleanup_comm()
