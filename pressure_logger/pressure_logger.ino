@@ -1,67 +1,85 @@
-/* On the SAMD21, if you set a pin to OUTPUT first, it defaults to LOW
-245 milliseconds is the wdt drift. For a timeout of 16384 it is 1.5%
-Gr=SDA pin4  W=SCL pin5  Bu=RX pin7  V=TX pin6  ADC pin10 R1 = 1M  R2 = 1.5M
-Current logic
+/* Communication logic
 'P' PC -> Arduino "Connect"
 'H'	Arduino -> PC "Handshake"
 'C'	PC -> Arduino	connected "Send the voltage"
 'V' arduino -> PC "Sent the voltage"
-'B' arduino -> PC "Backdoor" future
-'T' arduino -> PC "Time set" furture
 'D'	PC -> Arduino	"Send the data"
 'A' PC -> Arduino "Processed the data"
 'L' Arduino -> PC "Waiting for 'W' to wipe data or 'X' to disconnect"
 'W'	Wipe	PC -> Arduino	"Erase the memory."
 'E' Arduino -> PC "Memory wiped" waiting for 'X'
-'X'	eXit	PC -> Arduino	"Close session and go to sleep."
-Data Flow	0x02	STX	Arduino → PC	"Start of Text" (Binary start)
-0x03	ETX	Arduino → PC	"End of Text" (Binary end)
-**********RTC time set*************
+'X'	exit	PC -> Arduino	"Close session and go to sleep."
+['B' PC -> Arudino "Backdoor" Furture]
+['T' PC -> Arduino "Time syncronize" Furture]
+**********Data Flow**************************************
+0xAA 0x55	STX	Arduino → PC	"Start of Text" (Binary start)
+0x55 0xAA	ETX	Arduino → PC	"End of Text" (Binary end)
+STX > Data > ETX > CRC
+**********RTC time set*************************************************
 For true UTC/GMT unix time an offset must be added to the compile time
-PST (UTC-8) the offset is 8 hours * 3600 = +28800)
-PDT (UTC-7) the offset is 7 hours 8 3600 = +25200 
-Make sure to change it in setup*/
+Eastern Time (ET): Standard is UTC−05:00; Daylight is UTC−04:00
+Central Time (CT): Standard is UTC−06:00; Daylight is UTC−05:00
+Mountain Time (MT): Standard is UTC−07:00; Daylight is UTC−06:00
+Pacific Time (PT): Standard is UTC−08:00; Daylight is UTC−07:00
+Alaska Time (AKT): Standard is UTC−09:00; Daylight is UTC−08:00
+Hawaii-Aleutian Time (HAT): Standard is UTC−10:00
+Set UTC_OFFSET_HOURS = "Your timezone" 
+************Pin connections********************************************
+SDA pin 4
+SCL pin 5
+RX pin 7 external 6.8k pulldown resistor
+TX pin 6
+ADC pin 10 voltage divider 1M & 1.5M ~= 2.23V
+************Optional*******************************************
+To lower power consumption even more the main clock can be reduced 
+The default value is 48MHz
+Update the system clock variable to reflect your new speed (e.g., 12 MHz)
+SystemCoreClock = 12000000; 
+Recalculate and reload the SysTick timer so millis() stays accurate
+SysTick_Config(SystemCoreClock / 1000);  */
 
 #include <Adafruit_FRAM_I2C.h>
-#include <Adafruit_SleepyDog.h>
 #include <MS5837.h>
-#include <RTCZero.h>
 #include <Wire.h>
-#include<time.h>
+#include <time.h>
 
-// Define states
+// Operating states states
 enum DeviceState
 {
-  CHECK_COMM,
+  CHECK_UART,
   READ_SENSOR,
-  SLEEP_MODE,
-  ACTIVE_DEPLOYMENT
+  SHELF_MODE,
 };
-
-DeviceState currentState = CHECK_COMM; // Start here
+DeviceState currentState = CHECK_UART; // Start here
 
 // Global Objects
 MS5837 sensor;
 Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();
-RTCZero rtc;
 
 // Handshake Constants
-char cmd = ' ';
-const byte TX_pin = 6;           // serial TX pin
-const byte RX_pin = 7;           // serial RX and "is-wet" test pin
-const byte service_pin = 8;      // jumper for USB. wont be in production code
-const byte measure_battery = 10; // ADC input from voltage divider for battery test
+const byte TX_pin = 6;                    // serial TX pin
+const byte RX_pin = 7;                    // serial RX pin
+const byte measure_battery = 10;          // ADC input from voltage divider for battery test
 
 // Runtime Variables
-uint32_t sleepDuration = 5; // Default transition sleep
+const uint8_t UTC_OFFSET_HOURS = 7;         // * besure to set your timezone* PDT 07/10/2026
+uint32_t sleep_duration;                    // Sleep duration = standby or measurement
+uint32_t standby_seconds = 5;               // The amount of time (in seconds) the logger sleeps when not deployed
+uint32_t measurement_interval = 10;         // The amount of time (in seconds) between pressure measurements
+uint32_t fram_size = 32768;
 uint16_t last_pressure = 0;
-uint16_t current_address; // keeps tract of where deployments end
+const uint16_t START_THRESHOLD = 2000;
+const uint16_t STOP_THRESHOLD = 1100;
+uint16_t current_address;                   // keeps tract of where deployments end
 uint16_t last_valid_address = 2;
-const uint16_t FRAM_DATA_END = 0x7FFB;     // last usable data byte
-const uint16_t FRAM_POINTER_ADDR = 0x7FFC; // start of pointer region
-bool fram_wrapped = false;                 // true once we've wrapped at least once
+const uint16_t FRAM_DATA_END = 0x7FFB;      // last usable data byte
+const uint16_t FRAM_POINTER_ADDR = 0x7FFC;  // start of pointer region
+bool fram_wrapped = false;                  // true once we've wrapped at least once
+volatile bool alarmFired = false;
 
 // Function Prototypes
+void RTC_Handler();
+void fram_erase();
 void update_pointer();
 void recover_fram_address();
 void handle_active_deployment(uint16_t initial_pressure);
@@ -76,370 +94,559 @@ void inject_test_data();
 bool handle_uart_session();
 uint16_t crc16_update(uint16_t crc, uint8_t data);
 
-void setup() 
+void setup()
 {
-    delay(500); // Settling delay 
+    delay(5000);// 5 second delay to help upload code. leave 1000 before upload of final code
+    // --- Unexposed pin configuration ---
+    pinMode(0, INPUT_PULLUP);
+    pinMode(1, INPUT_PULLUP);
+    pinMode(2, INPUT_PULLUP);
+    pinMode(3, INPUT_PULLUP);
+    pinMode(9, INPUT_PULLUP);
+    pinMode(measure_battery, INPUT);
 
-    // Set ALL 10 GPIO pins to INPUT_PULLUP to prevent floating current
-    for (int i = 0; i <= 10; i++) 
-    {
-        // Skip pins used for I2C (4, 5) and Serial (6, 7)
-        if (i != 4 && i != 5 && i != 6 && i != 7) 
-        {
-            pinMode(i, INPUT_PULLUP);
-        }
-    }
+     // --- Exposed pin configuration ---
+    pinMode(RX_pin, INPUT);               //has 6.8k externak pulldown
+    pinMode(TX_pin, INPUT_PULLDOWN);
 
-    // Kill the On-board LEDs (D11, D12, D13) HIGH = OFF
-    digitalWrite(11, HIGH); // TX LED
+    // --- LEDS Off ---
+    // --- The power LED has been physicaly removed ---
+    digitalWrite(11, HIGH);
     pinMode(11, OUTPUT);
-    digitalWrite(12, HIGH); // RX LED
+    digitalWrite(12, HIGH);
     pinMode(12, OUTPUT);
-    digitalWrite(13, HIGH); // User LED
+    digitalWrite(13, HIGH);
     pinMode(13, OUTPUT);
 
-    pinMode(measure_battery, INPUT); 
-    pinMode(service_pin, INPUT_PULLUP);
-    delay(100);
+    // 1. Enable external 32.768 kHz crystal
+    SYSCTRL->XOSC32K.reg =
+        SYSCTRL_XOSC32K_STARTUP(0x6u) |
+        SYSCTRL_XOSC32K_XTALEN |
+        SYSCTRL_XOSC32K_EN32K |
+        SYSCTRL_XOSC32K_ENABLE |
+        SYSCTRL_XOSC32K_RUNSTDBY;
 
-    if (digitalRead(service_pin) == LOW) 
+    while (!SYSCTRL->PCLKSR.bit.XOSC32KRDY);
+
+    // 2. Route crystal to GCLK2 (divide by 32 → 1024 Hz)
+    GCLK->GENDIV.reg =
+        GCLK_GENDIV_ID(2) |
+        GCLK_GENDIV_DIV(4);
+
+    GCLK->GENCTRL.reg =
+        GCLK_GENCTRL_ID(2) |
+        GCLK_GENCTRL_SRC_XOSC32K |
+        GCLK_GENCTRL_DIVSEL |
+        GCLK_GENCTRL_GENEN |
+        GCLK_GENCTRL_RUNSTDBY;
+
+    while (GCLK->STATUS.bit.SYNCBUSY);
+
+    // 3. Connect GCLK2 to RTC
+    GCLK->CLKCTRL.reg =
+        GCLK_CLKCTRL_ID_RTC |
+        GCLK_CLKCTRL_GEN_GCLK2 |
+        GCLK_CLKCTRL_CLKEN;
+
+    while (GCLK->STATUS.bit.SYNCBUSY);
+
+    // 4. Reset RTC
+    RTC->MODE2.CTRL.reg = RTC_MODE2_CTRL_SWRST;
+
+    while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+    while (RTC->MODE2.CTRL.bit.SWRST);
+
+    // 5. Configure RTC in MODE2 (calendar) with 1024 prescaler
+    RTC->MODE2.CTRL.reg =
+        RTC_MODE2_CTRL_MODE_CLOCK |
+        RTC_MODE2_CTRL_PRESCALER_DIV1024;
+
+    while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+   // 6. Initialize the RTC calendar
+    char month_str[4];
+    int day;
+    int year;
+    int hour;
+    int minute;
+    int second;
+
+    sscanf(__DATE__, "%3s %d %d", month_str, &day, &year);
+    sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second);
+
+    const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+
+    int month = (strstr(months, month_str) - months) / 3 + 1;
+
+    // 7. Convert compiler local time to UTC 
+    hour += UTC_OFFSET_HOURS;
+
+    while (hour >= 24)
     {
-        USBDevice.attach();
-        delay(5000);
-    }
-    else 
-    {
-        // Turn off USB and ADC to save power
-        USBDevice.detach();
-        ADC->CTRLA.bit.ENABLE = 0;
-        
-        while (ADC->STATUS.bit.SYNCBUSY)
+        hour -= 24;
+        day++;
+
+        int days_in_month;
+
+        switch (month)
         {
-            // Do nothing, wait for ADC to stop safely
+            case 1:
+            case 3:
+            case 5:
+            case 7:
+            case 8:
+            case 10:
+            case 12:
+                days_in_month = 31;
+                break;
+
+            case 4:
+            case 6:
+            case 9:
+            case 11:
+                days_in_month = 30;
+                break;
+
+            case 2:
+                if ((year % 4 == 0 && year % 100 != 0) ||
+                    (year % 400 == 0))
+                {
+                    days_in_month = 29;
+                }
+                else
+                {
+                    days_in_month = 28;
+                }
+                break;
+
+            default:
+                days_in_month = 31;
+                break;
+        }
+
+        if (day > days_in_month)
+        {
+            day = 1;
+            month++;
+
+            if (month > 12)
+            {
+                month = 1;
+                year++;
+            }
         }
     }
 
-    // 1. Initialize core communication buses first
-    Wire.begin();
-    Wire.setClock(400000); // Fast I2C reduces CPU "on time"
-    delay(10);
+  uint8_t yy = year - 2000;
 
-    // 2. Initialize the RTC library to establish baseline settings
-    rtc.begin(); 
+  RTC->MODE2.CLOCK.reg =
+  RTC_MODE2_CLOCK_YEAR(yy) |
+  RTC_MODE2_CLOCK_MONTH(month) |
+  RTC_MODE2_CLOCK_DAY(day) |
+  RTC_MODE2_CLOCK_HOUR(hour) |
+  RTC_MODE2_CLOCK_MINUTE(minute) |
+  RTC_MODE2_CLOCK_SECOND(second);
 
-    // 3. SAFE BITWISE OVERRIDES: Keep external crystal active during sleep
-    SYSCTRL->XOSC32K.reg |= SYSCTRL_XOSC32K_RUNSTDBY;
-    SYSCTRL->XOSC32K.reg &= ~SYSCTRL_XOSC32K_ONDEMAND;
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-    while (!SYSCTRL->PCLKSR.bit.XOSC32KRDY) 
-    {
-        // Do nothing, wait for crystal to stabilize
-    }
+  // 8. Set the Alarm Mask Type
+  RTC->MODE2.Mode2Alarm[0].MASK.reg = RTC_MODE2_MASK_SEL_YYMMDDHHMMSS;
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-    // 4. Route XOSC32K into GCLK2 and force it to run during sleep
-    GCLK->GENDIV.reg = GCLK_GENDIV_ID(2); 
-    GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(2) | GCLK_GENCTRL_SRC_XOSC32K | GCLK_GENCTRL_GENEN | GCLK_GENCTRL_RUNSTDBY;
+  // 9. Enable Alarm 0 hardware interrupt 
+  //    Clear any pending ALARM0 interrupt
+  RTC->MODE2.INTFLAG.reg = RTC_MODE2_INTFLAG_ALARM0;
 
-    while (GCLK->STATUS.bit.SYNCBUSY) 
-    {
-        // Do nothing, wait for synchronization
-    }
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-    // 5. Connect GCLK2 to the RTC peripheral
-    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID(RTC_GCLK_ID) | GCLK_CLKCTRL_GEN_GCLK2 | GCLK_CLKCTRL_CLKEN;
+  // 10. Enable ALARM0 interrupt in the RTC
+  RTC->MODE2.INTENSET.reg = RTC_MODE2_INTENSET_ALARM0;
 
-    while (GCLK->STATUS.bit.SYNCBUSY) 
-    {
-        // Do nothing, wait for final sync
-    }
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-    // 6. Automatically sync internal time to code compilation time
-    struct tm tm_compile;
-    char month_name[4]; 
+  // 11. Enable the interrupt in the NVIC
+  NVIC_ClearPendingIRQ(RTC_IRQn);
+  NVIC_EnableIRQ(RTC_IRQn);
 
-    sscanf(__DATE__, "%3s %d %d", month_name, &tm_compile.tm_mday, &tm_compile.tm_year);
-    sscanf(__TIME__, "%d:%d:%d", &tm_compile.tm_hour, &tm_compile.tm_min, &tm_compile.tm_sec);
+  // 12. Enable RTC calander
+  RTC->MODE2.CTRL.bit.ENABLE = 1;
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-    const char month_lookup[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-    tm_compile.tm_mon = (strstr(month_lookup, month_name) - month_lookup) / 3;
-    tm_compile.tm_year -= 1900;
-    tm_compile.tm_isdst = -1; 
+  // 13. Initialize the Wire bus 
+  Wire.begin();
+  Wire.setClock(400000);
+  delay(50);
 
-    uint32_t compile_time_local = mktime(&tm_compile);
-    uint32_t offset = 25200; // UTC-7 PDT 
-    uint32_t compile_time_utc = compile_time_local + offset; 
+  // 14. Initialize the FRAM
+  if (fram.begin(0x50))
+  {
+    recover_fram_address();
+  }
 
-    if (rtc.getEpoch() < compile_time_utc) 
-    {
-        rtc.setEpoch(compile_time_utc);
-    }
-
-    // 7. Initialize FRAM and recover write pointer
-    if (fram.begin(0x50)) 
-    {
-        recover_fram_address(); 
-    }
-
-    // 8. Initialize the pressure sensor
-    sensor.setModel(MS5837::MS5837_30BA); 
-    sensor.setFluidDensity(1029);         
-    sensor.init();                        
-    delay(1000);
-
-    // 9. DISABLE THE BROWN-OUT DETECTOR FOR MAX SLEEP POWER SAVINGS
-    SYSCTRL->BOD33.bit.ENABLE = 0;
-
-    while (SYSCTRL->PCLKSR.bit.BOD33RDY) 
-    {
-        // Do nothing, wait for BOD33 to safely turn off completely
-    }
-
-    // 10. Enable system Watchdog safety right before loop execution begins
-    Watchdog.enable(16384);
+  // 15. Initialize sensor
+  sensor.setModel(MS5837::MS5837_30BA); // using 300 meter sensor
+  sensor.setFluidDensity(1029);         // Set for saltwater density
+  sensor.init();                        // wait for pressure sensor
+  delay(1000);
     
+  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // 16. Keep the Brown-Out Detector active during standby.
+  SYSCTRL->BOD33.bit.RUNSTDBY = 1;
+  while (!SYSCTRL->PCLKSR.bit.BOD33RDY);
+
+  // 17. WATCHDOG TIMER ACTIVATION (Hardened Deep Standby Safety Profile)
+  //     Watchdog peripheral is turned off before configuring
+  WDT->CTRL.bit.ENABLE = 0;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // 18. Configure the timeout window to ~16 seconds (16384 cycles) FIRST!
+  WDT->CONFIG.bit.PER = 0xB;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // 19. Turn the Watchdog peripheral ON using an atomic bitwise enable mask
+  WDT->CTRL.reg |= WDT_CTRL_ENABLE;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // 20. Clear the timer counter cleanly 
+  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // 21. Disable USB and ADC to consurve power consumption
+  USBDevice.detach();
+  ADC->CTRLA.bit.ENABLE = 0;
+
+  while (ADC->STATUS.bit.SYNCBUSY);
+  sleep_duration = standby_seconds;
+
   // --- TEMPORARY DESK TESTING ONLY ---
-  // This will overwrite your memory with fake data every time it boots.
-  // Comment this out before your real deployment
+  // This will overwrite the memory with fake data every time it boots.
+  // Delete this for production
   inject_test_data();
 }
-/*********************************************************************************/
+/************************************************************************************************************/
 
 void loop()
 {
-  Watchdog.reset();
 
-  // --- Read sensor once per wake cycle ---
-  sensor.read();
-  uint16_t initial_pressure = (uint16_t)sensor.pressure();
-  // --- UART wake detection 
-  pinMode(RX_pin, INPUT_PULLDOWN);
-  delayMicroseconds(300);
+  // WATCHDOG RESET "pet the dog"
+  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+  while (WDT->STATUS.bit.SYNCBUSY);
 
-  if (digitalRead(RX_pin) == HIGH)
+  switch (currentState)
+  {   //start of switch
+
+    /*------------------------------------------------------------------------*/
+    case CHECK_UART: 
+    {
+      if (digitalRead(RX_pin) == LOW)
+      {
+          currentState = READ_SENSOR;
+          break;
+      }
+
+      delay(50);
+
+      if (digitalRead(RX_pin) != HIGH)
+      {
+          currentState = READ_SENSOR;
+          break;
+      }
+
+      handle_uart_session();
+      sleep_duration = standby_seconds;
+      currentState = SHELF_MODE;
+    }
+
+    /*-------------------------------------------------------------------------*/
+    case READ_SENSOR: // Read the pressure sensor
+    {
+      sensor.read();
+      uint16_t initial_pressure = (uint16_t)sensor.pressure();
+
+      // Make sure sensor reading is not a wild glitch
+      bool valid_pressure = true;
+      if (last_pressure == 0)
+      {
+          last_pressure = initial_pressure;
+      }
+
+      // At a normal descent rate these values are reasonable
+      if (initial_pressure < 300 || initial_pressure > 6000)
+      {
+          valid_pressure = false;
+      }
+
+      int32_t diff = (int32_t)initial_pressure - (int32_t)last_pressure;
+      if (abs(diff) > 2000)
+      {
+          valid_pressure = false;
+      }
+
+      if (!valid_pressure)
+      {
+          sleep_duration = standby_seconds;
+          currentState = SHELF_MODE;
+          break;
+      }
+
+      last_pressure = initial_pressure;
+
+      if (initial_pressure >= START_THRESHOLD)
+      {
+          start_new_deployment(initial_pressure);
+          handle_active_deployment();
+      }       
+      sleep_duration = standby_seconds;
+      currentState = SHELF_MODE;
+      break;
+   }
+
+    /*--------------------------------------------------------------------*/
+   case SHELF_MODE:
+   {
+      go_to_sleep(sleep_duration);
+      currentState = CHECK_UART;
+      break;
+   } // end of case  
+  } //end of switch
+} //end of loop
+
+/*****************************************************************************/
+void go_to_sleep(uint32_t seconds)
+{
+   RTC->MODE2.READREQ.reg =
+            RTC_READREQ_RREQ |
+            RTC_READREQ_ADDR(0x10);
+   while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+
+  // Read current seconds
+  uint8_t current_sec = RTC->MODE2.CLOCK.bit.SECOND;
+
+  uint8_t target_sec = current_sec + seconds;
+
+  if (target_sec >= 60)
   {
-    // Now switch to UART mode
+      target_sec = target_sec - 60;
+  }
+
+  // Prevent immediate wake if rollover caused equality
+  if (target_sec == current_sec)
+  {
+      target_sec = target_sec + 1;
+
+      if (target_sec >= 60)
+      {
+          target_sec = target_sec - 60;
+      }
+  }
+
+  // PROGRAM ALARM 
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+  RTC->MODE2.Mode2Alarm[0].ALARM.reg = RTC_MODE2_ALARM_SECOND(target_sec);
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+  // Set mask for seconds only
+  RTC->MODE2.Mode2Alarm[0].MASK.reg = RTC_MODE2_MASK_SEL(1);
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+  // Clear and enable interrupt
+  RTC->MODE2.INTFLAG.reg = RTC_MODE2_INTFLAG_ALARM0;
+  NVIC_ClearPendingIRQ(RTC_IRQn);
+  RTC->MODE2.INTENSET.reg = RTC_MODE2_INTENSET_ALARM0;
+  NVIC_EnableIRQ(RTC_IRQn);
+
+  // Set for deep sleep
+  SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+
+  /*******Blinks LED for sleep durration***********
+  ****For testing only. Delete before uploading*****/
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(500);
+      digitalWrite(LED_BUILTIN, HIGH);
+
+  __DSB();
+  __ISB();
+  __WFI();
+}
+
+/***************************************************************************************/
+bool handle_uart_session() 
+{
+    // Setup Hardware Serial1 port
+    PM->APBCMASK.reg |= PM_APBCMASK_SERCOM1;
+    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_SERCOM1_CORE | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_CLKEN;
+    while (GCLK->STATUS.bit.SYNCBUSY);
+    
+    SERCOM1->USART.CTRLA.bit.SWRST = 1;
+    while (SERCOM1->USART.CTRLA.bit.SWRST || SERCOM1->USART.SYNCBUSY.bit.SWRST);
+    
     pinMode(TX_pin, OUTPUT);
     pinMode(RX_pin, INPUT);
-
-    Serial1.begin(9600);
-    handle_uart_session();
-    Serial1.end();
-
-    pinMode(TX_pin, INPUT);
-    pinMode(RX_pin, INPUT);
-    return;
-  }
-
-  // --- Validate pressure reading ---
-  bool valid_pressure = true;
-
-  if (last_pressure == 0)
-    last_pressure = initial_pressure;
-
-  if (initial_pressure < 300)
-    valid_pressure = false;
-  if (initial_pressure > 6000)
-    valid_pressure = false;
-
-  int32_t diff = (int32_t)initial_pressure - (int32_t)last_pressure;
-  if (abs(diff) > 2000)
-    valid_pressure = false;
-
-  if (!valid_pressure)
-  {
-    sleepDuration = 5;
-    go_to_sleep(sleepDuration);
-    return;
-  }
-
-  last_pressure = initial_pressure;
-
-  // --- State Machine ---
-  switch (currentState)
-  {
-  case READ_SENSOR:
-  {
-    if (initial_pressure >= 2000)
-    {
-      handle_active_deployment(initial_pressure);
-      sleepDuration = 10;
-    }
-    else
-    {
-      sleepDuration = 5;
+    Serial1.begin(115200);
+    while (SERCOM1->USART.SYNCBUSY.bit.ENABLE);
+    delay(50);
+    
+    while (Serial1.available() > 0) 
+    { 
+      Serial1.read(); 
     }
 
-    currentState = SLEEP_MODE;
-    break;
-  }
+    bool session_active = true; 
+    bool is_session_unlocked = false;
+    bool reached_stage_3 = false;
+    
+    //char cmd = 0;
+    uint32_t handshake_timeout_start = millis();
+    uint32_t disconnect_grace_start = 0;
 
-  case SLEEP_MODE:
-  {
+    //Switch case
+
+    while (session_active) 
+    {
+        WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+        while (WDT->STATUS.bit.SYNCBUSY);
+
+        // 1-Second cable glitch timmer for docking/debouncing
+        if (digitalRead(RX_pin) == LOW) 
+        {
+            if (disconnect_grace_start == 0) 
+            {
+                disconnect_grace_start = millis();
+            }
+            if (millis() - disconnect_grace_start > 1000) 
+            {
+                session_active = false; 
+            }
+        } 
+        else 
+        {
+            disconnect_grace_start = 0; 
+        }
+
+        // Get Charactor command
+        if (disconnect_grace_start == 0) 
+        {
+            if (Serial1.available() > 0) 
+            {
+                char cmd = Serial1.read();
+                switch (cmd) 
+                {
+                    
+                    // 1. Handshake PC -> 'P'
+                    case 'P': 
+                    {
+                        Serial1.write('H'); // Arduino -> 'H'
+                        Serial1.flush();
+                        handshake_timeout_start = millis(); // Start 5s limit to see a 'C'
+                        break;
+                    }
+
+                    // 2. Confirmed handshake PC -> 'C'
+                    case 'C': 
+                    {
+                        // If PC sends 'C' within 5 seconds of 'P', unlock the device
+                        if (millis() - handshake_timeout_start < 5000) 
+                        {
+                            get_battery_voltage();
+                            is_session_unlocked = true; 
+                            reached_stage_3 = true;     
+                        }
+                        break;
+                    }
+
+                    // 3. Request Data dump PC -> 'D'
+                    case 'D': 
+                    {
+                        if (is_session_unlocked) 
+                        {
+                            dump_data();
+                            delay(5);
+                            Serial1.flush();
+                        }
+                        break;
+                    }
+
+                    // 4. Acknolage received data PC -> 'A'
+                    case 'A': 
+                    {
+                        if (is_session_unlocked) 
+                        {
+                            Serial1.write('L'); // Arduino -> 'L' waiting for 'X' or 'W'
+                            Serial1.flush();
+                        }
+                        break;
+                    }
+
+                    // 5. Request FRAM erase PC -> 'W'
+                    case 'W': 
+                    {
+                        if (is_session_unlocked) 
+                        {
+                            fram_erase();
+                            Serial1.flush();
+                        }
+                        break;
+                    }
+
+                    // 6. Request disconnect of UART PC -> 'X'
+                    case 'X': 
+                    {
+                        session_active = false;
+                        break;
+                    }
+
+                    default: 
+                    {
+                        break;
+                    }
+                }
+                cmd = 0;
+                delay(1);
+            }
+        }
+    } 
+
+    // Shut down Serial port
+    Serial1.flush(); 
+    Serial1.end(); 
+    
+    pinMode(TX_pin, INPUT_PULLDOWN);
     pinMode(RX_pin, INPUT);
-    pinMode(TX_pin, INPUT);
-
-    go_to_sleep(sleepDuration);
-    currentState = READ_SENSOR;
-    break;
-  }
-
-  default:
-    currentState = READ_SENSOR;
-    break;
-  }
+    
+    return reached_stage_3;
 }
 
-//************************************************************************************************
-bool handle_uart_session()
-{
-  // 1. INITIALIZE HARDWARE
-  pinMode(TX_pin, OUTPUT);
-  pinMode(RX_pin, INPUT);
-
-  Serial1.begin(9600);
-  delay(50);
-
-  // Clear startup noise
-  while (Serial1.available() > 0)
-  {
-    Serial1.read();
-  }
-
-  // 2. STAGE 1: DETECTION ('P' -> 'H')
-  uint32_t listen_start = millis();
-  bool pc_detected = false;
-
-  while (millis() - listen_start < 200)
-  {
-    if (Serial1.available() > 0)
-    {
-      cmd = Serial1.read();
-
-      if (cmd == 'P')
-      {
-        Serial1.write('H');
-        pc_detected = true;
-        break;
-      }
-    }
-  }
-
-  // 3. STAGE 2: CONFIRMATION ('H' -> 'C')
-  bool session_confirmed = false;
-
-  if (pc_detected)
-  {
-    uint32_t wait_conf = millis();
-
-    while (millis() - wait_conf < 2000)
-    {
-      if (Serial1.available() > 0)
-      {
-        cmd = Serial1.read(); // 
-
-        if (cmd == 'C')
-        {
-          session_confirmed = true;
-          get_battery_voltage();
-          break;
-        }
-      }
-    }
-  }
-
-  // --- NEW: Track whether we actually reached Stage 3 ---
-  bool in_command_mode = false;
-
-  // 4. STAGE 3: COMMAND LOOP (AWAKE UNTIL DISCONNECT)
-  if (session_confirmed)
-  {
-    in_command_mode = true;
-
-    // This loop keeps the XIAO 100% awake until 'X' is received.
-    // No pinMode toggling here prevents corruption of incoming 'D' commands.
-    uint32_t last_activity = millis();
-
-    while (true)
-    {
-      Watchdog.reset();
-
-      // --- INACTIVITY TIMEOUT ---
-      if (millis() - last_activity > 10000)
-      {
-        break; // PC disconnected or app closed
-      }
-
-      if (Serial1.available() > 0)
-      {
-        last_activity = millis(); // reset timeout
-        cmd = Serial1.read();
-
-        if (cmd == 'D')
-        {
-          dump_data();
-        }
-        else if (cmd == 'A')
-        {
-          Serial1.write('L');
-        }
-        else if (cmd == 'W')
-        {
-          current_address = 2;
-          last_valid_address = 2;
-          fram_wrapped = false;
-          update_pointer();
-          Serial1.print('E');
-        }
-        else if (cmd == 'X')
-        {
-          break; // disconnect
-        }
-
-        delay(1);
-      }
-    }
-  }
-  // 5. CLEANUP
-  Serial1.end();
-  pinMode(TX_pin, INPUT);
-  pinMode(RX_pin, INPUT);
-
-  // --- RETURN ONLY IF WE REACHED STAGE 3 ---
-  return in_command_mode;
-}
 /******************************************************************************/
-void handle_active_deployment(uint16_t initial_pressure)
+void handle_active_deployment(void)
 {
-    // Start a new deployment header
-    start_new_deployment(initial_pressure);
+  while (true)
+  {
+    WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+    while (WDT->STATUS.bit.SYNCBUSY);
 
-    const uint16_t START_THRESHOLD = 2000;  // start logging
-    const uint16_t STOP_THRESHOLD  = 1100;  // stop logging (hysteresis)
+    // Read the pressure
+    sensor.read();
+    uint16_t pressure_value = (uint16_t)sensor.pressure();
 
-    while (true)
+    // Exit condition with hysteresis
+    if (pressure_value <= STOP_THRESHOLD)
     {
-        Watchdog.reset();
-
-        sensor.read();
-        uint16_t pressure_value = (uint16_t)sensor.pressure();
-
-        // Exit condition with hysteresis
-        if (pressure_value <= STOP_THRESHOLD)
-        {
-            return;   // deployment finished
-        }
-
-        // Log sample
-        save_pressure(pressure_value);
-
-        // Keep RX quiet during sleep
-        pinMode(RX_pin, INPUT_PULLDOWN);
-
-        // Sleep 10 seconds between samples
-        go_to_sleep(10);
-
-        delay(50); // I2C settle
+      return; // deployment finished
     }
+
+    // Log sample to FRAM
+    save_pressure(pressure_value);
+
+    // Sleep 10 seconds between samples
+    go_to_sleep(measurement_interval);
+
+    delay(50); // I2C settle
+  }
 }
 
 /***********************************************************************/
@@ -454,166 +661,203 @@ void start_new_deployment(uint16_t initial_pressure)
   // 1. Write everything sequentially
   write_16(current_address, 0xFFFF);
 
-  uint32_t epoch = rtc.getEpoch();
-  write_32(current_address + 2, epoch); // Use offsets!
+  // 2. You have to request a read before you can read the register
+  RTC->MODE2.READREQ.reg =
+  RTC_READREQ_RREQ |
+  RTC_READREQ_ADDR(0x10);
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
 
-  if (initial_pressure == 0xFFFF || initial_pressure == 0x0003)
+  //read RTC time value register
+  uint32_t rtc_reg_value = RTC->MODE2.CLOCK.reg; 
+  while (RTC->MODE2.STATUS.bit.SYNCBUSY);
+
+  // 3. Convert to UNIX time
+  struct tm t;
+
+  // 1. Extract and unpack fields using masks and right-shifts
+  uint8_t second =  rtc_reg_value & 0x3F;          // Bits 5:0
+  uint8_t minute = (rtc_reg_value >> 6)  & 0x3F;   // Bits 11:6
+  uint8_t hour   = (rtc_reg_value >> 12) & 0x1F;   // Bits 16:12
+  uint8_t day    = (rtc_reg_value >> 17) & 0x1F;   // Bits 21:17
+  uint8_t month  = (rtc_reg_value >> 22) & 0x0F;   // Bits 25:22
+  uint8_t year   = (rtc_reg_value >> 26) & 0x3F;   // Bits 31:26
+
+  // 4. Map the fields to standard struct tm requirements
+  t.tm_sec  = second;                              // 0 to 59
+  t.tm_min  = minute;                              // 0 to 59
+  t.tm_hour = hour;                                // 0 to 23
+  t.tm_mday = day;                                 // 1 to 31
+  t.tm_mon  = month - 1;                           // time.h expects 0 (Jan) to 11 (Dec)
+  
+  // 5. Convert current year to a 1900-offset (e.g., 2026 - 1900 = 126)
+  int full_year = 2000 + year;
+  t.tm_year = full_year - 1900;                    // Years since 1900
+
+  // 6. Set daylight saving flag to -1 so mktime tries to determine it automatically, 
+  // or 0 if your hardware clock tracks strict UTC/Standard time.
+  t.tm_isdst = 0; 
+
+  // 7. Convert the populated struct tm into Unix epoch time (seconds since 1970)
+  time_t unix_timestamp = mktime(&t);
+
+  write_32(current_address + 2, unix_timestamp); 
+
+  if (initial_pressure == 0xFFFF)
   {
     initial_pressure = 0xFFFE;
   }
   write_16(current_address + 6, initial_pressure);
 
-  // 2. Advance your RAM pointer by the total 8 bytes
+  // 8. Advance RAM pointer by a total of 8 bytes
   current_address += 8;
   last_valid_address = current_address;
 
-  // 3. Commit it to physical FRAM ONCE
+  // 9. Write to FRAM
   update_pointer();
 }
 
 /******************************************************/
 void save_pressure(uint16_t pressure_value)
 {
-  // Ensure room for 2 bytes
+  // 1. Ensure room for 2 bytes
   if (current_address + 2 > FRAM_POINTER_ADDR)
   {
     current_address = 2;
     fram_wrapped = true;
   }
 
-  // Sanitize
-  if (pressure_value == 0xFFFF || pressure_value == 0x0003)
+  // 2. Sanitize
+  if (pressure_value == 0xFFFF)
   {
     pressure_value = 0xFFFE;
   }
 
-  // Write pressure sample
+  // 3. Write pressure sample
   write_16(current_address, pressure_value);
-  current_address = current_address + 2;
 
-  last_valid_address = current_address; // <-- REQUIRED FIX
+  current_address += 2;
+
+  if (current_address > (FRAM_POINTER_ADDR - 2))
+  {
+    current_address = 2;
+    fram_wrapped = true;
+  }
+
+  last_valid_address = current_address;
 
   update_pointer();
 }
 
 /********************************************************************/
-void dump_data()
+void dump_data() 
 {
-  Watchdog.reset();
+    WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+    while (WDT->STATUS.bit.SYNCBUSY);
 
-  // Clear UART RX buffer
-  uint32_t t0 = millis();
-  while (millis() - t0 < 20)
-  {
-    while (Serial1.available() > 0)
+    // 1. Clear UART RX buffer
+    uint32_t t0 = millis();
+    while (millis() - t0 < 20) 
     {
-      Serial1.read();
-    }
-  }
-
-  // Compute total valid bytes
-  uint16_t total_bytes = 0;
-
-  if (!fram_wrapped)
-  {
-    if (last_valid_address > 2)
-    {
-      total_bytes = last_valid_address - 2;
-    }
-    else
-    {
-      total_bytes = 0;
-    }
-  }
-  else
-  {
-    // FIX #1: inclusive range (2 → FRAM_DATA_END)
-    uint16_t before_wrap = (FRAM_DATA_END - 2) + 1;
-    uint16_t after_wrap = last_valid_address - 2;
-    total_bytes = before_wrap + after_wrap;
-  }
-
-  // Send STX
-  Serial1.write(0x02);
-
-  // Send size
-  uint8_t size_hi = (uint8_t)(total_bytes >> 8);
-  uint8_t size_lo = (uint8_t)(total_bytes & 0xFF);
-  Serial1.write(size_hi);
-  Serial1.write(size_lo);
-
-  // Stream FRAM data
-  uint16_t read_ptr = 2;
-  uint16_t bytes_remaining = total_bytes;
-
-  uint8_t buffer[64];
-  uint16_t crc = 0xFFFF;
-
-  while (bytes_remaining > 0)
-  {
-    Watchdog.reset();
-
-    uint8_t chunk;
-
-    if (bytes_remaining >= 64)
-    {
-      chunk = 64;
-    }
-    else
-    {
-      chunk = (uint8_t)bytes_remaining;
+        while (Serial1.available() > 0) 
+        {
+            Serial1.read();
+        }
     }
 
-    // Wrap only when exceeding FRAM_DATA_END
-    if (read_ptr + chunk > FRAM_DATA_END)
+    // 2. Compute total valid bytes
+    uint16_t total_bytes = 0;
+    if (!fram_wrapped) 
     {
-      uint16_t first = FRAM_DATA_END - read_ptr + 1;
-
-      fram.read(read_ptr, buffer, first);
-      Serial1.write(buffer, first);
-
-      for (uint16_t i = 0; i < first; i++)
-      {
-        crc = crc16_update(crc, buffer[i]);
-      }
-
-      bytes_remaining -= first;
-      read_ptr = 2;
-    }
-    else
+        if (last_valid_address > 2) 
+        {
+            total_bytes = last_valid_address - 2;
+        } 
+        else 
+        {
+            total_bytes = 0;
+        }
+    } 
+    else 
     {
-      fram.read(read_ptr, buffer, chunk);
-      Serial1.write(buffer, chunk);
-
-      for (uint16_t i = 0; i < chunk; i++)
-      {
-        crc = crc16_update(crc, buffer[i]);
-      }
-
-      read_ptr += chunk;
-
-      if (read_ptr > FRAM_DATA_END)
-      {
-        read_ptr = 2;
-      }
-
-      bytes_remaining -= chunk;
+        // 3. inclusive range (2 → FRAM_DATA_END)
+        uint16_t before_wrap = (FRAM_DATA_END - 2) + 1;
+        uint16_t after_wrap = last_valid_address - 2;
+        total_bytes = before_wrap + after_wrap;
     }
-  }
 
-  // Send ETX
-  Serial1.write(0x03);
+    // 4. Send Multi-byte STX (0xAA 0x55) ---
+    Serial1.write(0xAA);
+    Serial1.write(0x55);
 
-  // Send CRC
-  uint8_t crc_hi = (uint8_t)(crc >> 8);
-  uint8_t crc_lo = (uint8_t)(crc & 0xFF);
-  Serial1.write(crc_hi);
-  Serial1.write(crc_lo);
+    // 5. Send size
+    uint8_t size_hi = (uint8_t)(total_bytes >> 8);
+    uint8_t size_lo = (uint8_t)(total_bytes & 0xFF);
+    Serial1.write(size_hi);
+    Serial1.write(size_lo);
 
-  Serial1.flush();
-  delay(100);
+    // 6. Stream FRAM data
+    uint16_t read_ptr = 2;
+    uint16_t bytes_remaining = total_bytes;
+    uint8_t buffer[64];
+    uint16_t crc = 0xFFFF;
 
-  cmd = 0;
+    while (bytes_remaining > 0) 
+    {
+        WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+        while (WDT->STATUS.bit.SYNCBUSY);
+
+        uint8_t chunk;
+        if (bytes_remaining >= 64) 
+        {
+            chunk = 64;
+        } 
+        else 
+        {
+            chunk = (uint8_t)bytes_remaining;
+        }
+
+        // 7. Wrap only when exceeding FRAM_DATA_END
+        if (read_ptr + chunk > FRAM_DATA_END) 
+        {
+            uint16_t first = FRAM_DATA_END - read_ptr + 1;
+            fram.read(read_ptr, buffer, first);
+            Serial1.write(buffer, first);
+            for (uint16_t i = 0; i < first; i++) 
+            {
+                crc = crc16_update(crc, buffer[i]);
+            }
+            bytes_remaining -= first;
+            read_ptr = 2;
+        } 
+        else 
+        {
+            fram.read(read_ptr, buffer, chunk);
+            Serial1.write(buffer, chunk);
+            for (uint16_t i = 0; i < chunk; i++) 
+            {
+                crc = crc16_update(crc, buffer[i]);
+            }
+            read_ptr += chunk;
+            if (read_ptr > FRAM_DATA_END) 
+            {
+                read_ptr = 2;
+            }
+            bytes_remaining -= chunk;
+        }
+    }
+
+    // 8. Send Multi-byte ETX (0x55 0xAA) ---
+    Serial1.write(0x55);
+    Serial1.write(0xAA);
+
+    // 9.Send CRC
+    uint8_t crc_hi = (uint8_t)(crc >> 8);
+    uint8_t crc_lo = (uint8_t)(crc & 0xFF);
+    Serial1.write(crc_hi);
+    Serial1.write(crc_lo);
+
+    Serial1.flush();
+    delay(100);
 }
 
 /******************************************************/
@@ -636,21 +880,6 @@ uint16_t crc16_update(uint16_t crc, uint8_t data)
   return crc;
 }
 
-/*******************************************************/
-void go_to_sleep(uint32_t seconds)
-{
-  // 1. Calculate the exact second to wake up
-  uint32_t alarm_time = rtc.getEpoch() + seconds;
-  rtc.setAlarmEpoch(alarm_time);
-
-  // 2. Tell the RTC hardware to watch for this specific time
-  rtc.enableAlarm(rtc.MATCH_HHMMSS);
-
-  // 3. Enter deepest sleep mode (~15-40uA)
-  // The CPU stops here until the RTC alarm triggers
-  rtc.standbyMode();
-}
-
 /****************************************************************************/
 void write_16(uint16_t address, uint16_t value)
 {
@@ -670,7 +899,7 @@ void write_32(uint16_t address, uint32_t value)
   buffer[2] = (uint8_t)(value >> 8);
   buffer[3] = (uint8_t)(value & 0xFF);
 
-  // library's multi-byte write is better for battery than 4 single writes
+  // Write multipal bytes
   fram.write(address, buffer, 4);
 }
 /******************************************************************************/
@@ -683,7 +912,7 @@ void update_pointer()
   // 1. Write to Primary Slot using multi-byte write
   fram.write(FRAM_POINTER_ADDR, buffer, 2);
 
-  delayMicroseconds(100); // Tiny pause to let the I2C bus rest
+  delay(1); // Tiny pause to let the I2C bus rest
 
   // 2. Write to Mirror Slot using multi-byte write
   fram.write(0x7FFE, buffer, 2);
@@ -693,52 +922,121 @@ void update_pointer()
 
 void recover_fram_address()
 {
-  // 1. Safe 2-byte read buffer
   uint8_t buffer[2];
 
-  // 2. Safely grab Primary Pointer
+  // 1. Safely grab Primary Pointer
   fram.read(FRAM_POINTER_ADDR, buffer, 2);
   uint16_t primary = ((uint16_t)buffer[0] << 8) | buffer[1];
 
-  // 3. Safely grab Mirror Pointer
+  // 2. Safely grab Mirror Pointer
   fram.read(0x7FFE, buffer, 2);
   uint16_t mirror = ((uint16_t)buffer[0] << 8) | buffer[1];
 
-  // Helper lambda to validate a pointer
+  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
+  while (WDT->STATUS.bit.SYNCBUSY);
+
+  // Data region limits
+  constexpr uint16_t DATA_START = 0x0002;
+  constexpr uint16_t MAX_DATA_ADDR = FRAM_POINTER_ADDR - 2; // 0x7FFA
+
   auto is_valid = [&](uint16_t p)
   {
-    if (p < 2 || p > FRAM_DATA_END) return false;
-    if (p & 0x0001) return false; // Must be even (samples are 2 bytes)
-    if (p >= 0x7FFC) return false; // Must not point into pointer storage region
-    if (p == 0x0000 || p == 0xFFFF) return false;
+    // Must stay strictly inside data region, never into pointer storage
+    if (p < DATA_START || p > MAX_DATA_ADDR)
+    {
+      return false;
+    }
+
+    // 2-byte alignment
+    if (p & 0x0001)
+    {
+      // Severe corruption fallback
+      return false;
+    }
+
+    // Individual sentinel checks
+    if (p == 0x0000 || p == 0xFFFF)
+    {
+      return false;
+    }
+
     return true;
   };
+
+  // Check if new FRAM or erased FRAM
+  if ((primary == 0x0000 && mirror == 0x0000) || (primary == 0xFFFF && mirror == 0xFFFF))
+  {
+    current_address = DATA_START;
+    update_pointer();
+    return;
+  }
 
   bool primary_ok = is_valid(primary);
   bool mirror_ok = is_valid(mirror);
 
   if (primary_ok && mirror_ok)
   {
-    // Both valid → choose the larger one (monotonic pointer)
-    current_address = (primary >= mirror) ? primary : mirror;
+    // Both valid → choose the newer one
+    if (primary >= mirror)
+    {
+      current_address = primary;
+    }
+    else
+    {
+      current_address = mirror;
+    }
+
     if (primary != mirror)
-      update_pointer();
+    {
+      update_pointer(); // self-heal disagreement
+    }
   }
   else if (primary_ok)
   {
     current_address = primary;
-    update_pointer();
+    update_pointer(); // heal mirror
   }
   else if (mirror_ok)
   {
     current_address = mirror;
-    update_pointer();
+    update_pointer(); // heal primary
   }
   else
   {
-    current_address = 2;
+    // Severe corruption fallback
+    current_address = DATA_START;
     update_pointer();
   }
+}
+
+/****************************************************************************/
+void fram_erase() 
+{ 
+    // 1. Execute full chip wipe (32KB @ 400kHz)
+    for (uint32_t i = 0; i < fram_size; i++) 
+    { 
+        fram.write(i, 0x00); 
+        
+        // Kick watchdog every 4096 bytes
+        if (i % 4096 == 0) 
+        { 
+            WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY; 
+            while (WDT->STATUS.bit.SYNCBUSY); 
+        } 
+    } 
+
+    WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY; 
+    while (WDT->STATUS.bit.SYNCBUSY); 
+
+    // 2. Reset pointers instantly (FRAM writes are inherently reliable)
+    current_address = 2; 
+    last_valid_address = 2; 
+    fram_wrapped = false; 
+    update_pointer(); 
+
+    // 3. Send Success Token immediately 
+    Serial1.write('E'); 
+    Serial1.flush();    
 }
 
 /***********************************************************************************/
@@ -746,31 +1044,45 @@ void get_battery_voltage()
 {
   // Wake ADC and wait for it to wake up
   // 1. Configure settings FIRST (ADC is disabled in setup)
-  analogReadResolution(12);
-  analogReference(AR_INTERNAL2V23);
-  ADC->SAMPCTRL.reg = ADC_SAMPCTRL_SAMPLEN(63);
+  analogReadResolution(12);// 12 bit resolution
+  analogReference(AR_INTERNAL2V23);// 2.23V referance
+  ADC->SAMPCTRL.reg = ADC_SAMPCTRL_SAMPLEN(63); // 63 samples
+
   // 2. Enable the ADC
   ADC->CTRLA.bit.ENABLE = 1;
+
   // 3. Wait for the ENABLE bit to synchronize
-  while (ADC->STATUS.bit.SYNCBUSY)
-    ;
+  while (ADC->STATUS.bit.SYNCBUSY);
   delay(5);
   analogRead(measure_battery); // Sacrificial read to clear internal ADC charge
-  // Take a measurement
+
+  // 4. Take a measurement
   uint16_t adc_value = analogRead(measure_battery);
   uint32_t battery_voltage = (uint32_t)adc_value * 907UL; // 0.000907 * 1000
   battery_voltage = battery_voltage / 1000UL;             // Now battery_voltage is in millivolts
-  // Disable ADC
-  ADC->CTRLA.bit.ENABLE = 0;
-  while (ADC->STATUS.bit.SYNCBUSY)
-    ;
 
-  // Send battery_voltage;
+  // 5. Disable ADC
+  ADC->CTRLA.bit.ENABLE = 0;
+  while (ADC->STATUS.bit.SYNCBUSY);
+
+  // 6. Send battery_voltage;
   Serial1.print(battery_voltage);
   Serial1.write('V');
 }
 
+/******************************************************************/
+// Global Hardware Interrupt Routine 
+  void RTC_Handler(void) 
+  { 
+  if (RTC->MODE2.INTFLAG.bit.ALARM0) 
+  { 
+    RTC->MODE2.INTFLAG.reg = RTC_MODE2_INTFLAG_ALARM0; // Clear interrupt flag
+    alarmFired = true; 
+  } 
+}
+
 /************This is for testing only*****************/
+/**************Delete before uploading****************/
 void inject_test_data()
 {
   // 1. Reset write pointer to start of data region
@@ -778,15 +1090,15 @@ void inject_test_data()
   fram_wrapped = false;
   last_valid_address = 2;
 
-  // 2. Start a deployment with a safe initial pressure
-  uint16_t safe_initial = 1025; // already guaranteed != 0x0003
+  // 2. Start a deployment 
+  uint16_t safe_initial = 1025; 
   start_new_deployment(safe_initial);
 
   // 3. Write 20 fake samples (pressure ramp)
   for (int i = 0; i < 20; i++)
   {
     uint16_t fake_pressure = 2000 + (i * 100);
-    save_pressure(fake_pressure); // also guaranteed != 0x0003
+    save_pressure(fake_pressure); 
   }
 
   // 4. Update last_valid_address to the final write location
