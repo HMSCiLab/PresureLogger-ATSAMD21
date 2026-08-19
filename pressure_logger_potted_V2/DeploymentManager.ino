@@ -97,9 +97,7 @@ void write_16(uint16_t address, uint16_t value)
   buffer[0] = (uint8_t)(value >> 8);
   buffer[1] = (uint8_t)(value & 0xFF);
 
-#ifndef DEBUG_NO_HARDWARE
   fram.write(address, buffer, 2);
-#endif
 }
 
 /****************************************************************************/
@@ -112,8 +110,6 @@ void write_32(uint16_t address, uint32_t value)
   buffer[3] = (uint8_t)(value & 0xFF);
 
   // library's multi-byte write is better for battery than 4 single writes
-#ifndef DEBUG_NO_HARDWARE
   fram.write(address, buffer, 4);
-#endif
 }
 

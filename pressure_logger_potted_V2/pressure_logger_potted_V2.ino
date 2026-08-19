@@ -41,9 +41,6 @@ Make sure to change it in setup*/
 #define SERIAL_LOG(x)
 #endif
 
-// Uncomment this line to exclude code that requires hardware.
-#define DEBUG_NO_HARDWARE
-
 // Define states
 enum DeviceState
 {
@@ -80,6 +77,7 @@ bool fram_wrapped = false;                 // true once we've wrapped at least o
 
 // Function Prototypes
 void SetupIOPins();
+void SetupCrystal();
 void SetupUsbDevice();
 void SetupRtc();
 void recover_fram_address();
@@ -95,6 +93,8 @@ void setup()
 
   SERIAL_LOG("SetupIOPins()");
   SetupIOPins();
+  SERIAL_LOG("SetupCrystal()");
+  SetupCrystal();
   SERIAL_LOG("SetupUsbDevice()");
   SetupUsbDevice();
   SERIAL_LOG("SetupRtc()");
@@ -112,12 +112,10 @@ void setup()
   }
 
   // 8. Initialize the pressure sensor
-#ifndef DEBUG_NO_HARDWARE
   sensor.setModel(MS5837::MS5837_30BA); 
   sensor.setFluidDensity(1029);         
   sensor.init();                        
   delay(1000);
-#endif
 
   // 9. DISABLE THE BROWN-OUT DETECTOR FOR MAX SLEEP POWER SAVINGS
   SYSCTRL->BOD33.bit.ENABLE = 0;
@@ -144,7 +142,7 @@ void loop()
   switch (currentState)
   {
     case DeviceState::CHECK_COMM:
-      if (handle_uart())
+      if (handle_uart_session())
         currentState = DeviceState::READ_SENSOR; // Resume normal operation after UART session
       break;
 
@@ -204,7 +202,7 @@ void loop()
     {
       SERIAL_LOG("UART wake detected");
       // Force UART session on next loop iteration
-      uartState = UartState::CLEAN_COMM;
+      uartSessionState = UartSessionState::CLEAN_COMM;
       currentState = DeviceState::CHECK_COMM;
     }
   }
@@ -287,35 +285,69 @@ void loop_old()
 /*******************************************************/
 void SetupIOPins()
 {
-  delay(500); // Settling delay 
+  delay(5000); // Settling delay 
 
-  // Set ALL 10 GPIO pins to INPUT_PULLUP to prevent floating current
-  for (int i = 0; i <= 10; i++) 
-  {
-    // Skip pins used for I2C (4, 5) and Serial (6, 7)
-    if (i != 4 && i != 5 && i != 6 && i != 7) 
-    {
-      pinMode(i, INPUT_PULLUP);
-    }
-  }
+  // --- Unexposed pin configuration ---
+  pinMode(0, INPUT_PULLUP);
+  pinMode(1, INPUT_PULLUP);
+  pinMode(2, INPUT_PULLUP);
+  pinMode(3, INPUT_PULLUP);
+  pinMode(9, INPUT_PULLUP);
+  pinMode(measure_battery, INPUT); 
 
-  // Kill the On-board LEDs (D11, D12, D13) HIGH = OFF
+  // --- Exposed pin configuration ---
+  pinMode(RX_pin, INPUT);               //has 6.8k externak pulldown
+  pinMode(TX_pin, INPUT_PULLDOWN);
+
+  // --- LEDS Off ---
+  // --- The power LED has been physicaly removed ---
   digitalWrite(11, HIGH); // TX LED
   pinMode(11, OUTPUT);
   digitalWrite(12, HIGH); // RX LED
   pinMode(12, OUTPUT);
   digitalWrite(13, HIGH); // User LED
   pinMode(13, OUTPUT);
+}
 
-  pinMode(measure_battery, INPUT); 
-  pinMode(service_pin, INPUT_PULLUP);
-  delay(100);
+/*******************************************************/
+void SetupCrystal()
+{
+  // 1. Enable external 32.768 kHz crystal
+  SYSCTRL->XOSC32K.reg =
+      SYSCTRL_XOSC32K_STARTUP(0x6u) |
+      SYSCTRL_XOSC32K_XTALEN |
+      SYSCTRL_XOSC32K_EN32K |
+      SYSCTRL_XOSC32K_ENABLE |
+      SYSCTRL_XOSC32K_RUNSTDBY;
+
+  while (!SYSCTRL->PCLKSR.bit.XOSC32KRDY);
+
+  // 2. Route crystal to GCLK2 (divide by 32 → 1024 Hz)
+  GCLK->GENDIV.reg =
+      GCLK_GENDIV_ID(2) |
+      GCLK_GENDIV_DIV(4);
+
+  GCLK->GENCTRL.reg =
+      GCLK_GENCTRL_ID(2) |
+      GCLK_GENCTRL_SRC_XOSC32K |
+      GCLK_GENCTRL_DIVSEL |
+      GCLK_GENCTRL_GENEN |
+      GCLK_GENCTRL_RUNSTDBY;
+
+  while (GCLK->STATUS.bit.SYNCBUSY);
+
+  // 3. Connect GCLK2 to RTC
+  GCLK->CLKCTRL.reg =
+      GCLK_CLKCTRL_ID_RTC |
+      GCLK_CLKCTRL_GEN_GCLK2 |
+      GCLK_CLKCTRL_CLKEN;
+
+  while (GCLK->STATUS.bit.SYNCBUSY);
 }
 
 /*******************************************************/
 void SetupUsbDevice()
 {
-#ifndef DEBUG_NO_HARDWARE
     if (digitalRead(service_pin) == LOW) 
     {
         USBDevice.attach();
@@ -332,7 +364,6 @@ void SetupUsbDevice()
             // Do nothing, wait for ADC to stop safely
         }
     }
-#endif
 }
 
 /*******************************************************/
@@ -392,7 +423,6 @@ void SetupRtc()
 /*******************************************************/
 void go_to_sleep(uint32_t seconds)
 {
-#ifndef DEBUG_NO_HARDWARE
   // 1. Calculate the exact second to wake up
   uint32_t alarm_time = rtc.getEpoch() + seconds;
   rtc.setAlarmEpoch(alarm_time);
@@ -403,9 +433,6 @@ void go_to_sleep(uint32_t seconds)
   // 3. Enter deepest sleep mode (~15-40uA)
   // The CPU stops here until the RTC alarm triggers
   rtc.standbyMode();
-#else
-  delay(seconds * 1000);
-#endif
 }
 
 /*************************************************************************************/
@@ -416,21 +443,11 @@ void recover_fram_address()
   uint8_t buffer[2];
 
   // 2. Safely grab Primary Pointer
-#ifndef DEBUG_NO_HARDWARE
   fram.read(FRAM_POINTER_ADDR, buffer, 2);
-#else
-  buffer[0] = FRAM_POINTER_ADDR >> 8;
-  buffer[1] = FRAM_POINTER_ADDR & 0xff;
-#endif
   uint16_t primary = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // 3. Safely grab Mirror Pointer
-#ifndef DEBUG_NO_HARDWARE
   fram.read(0x7FFE, buffer, 2);
-#else
-  buffer[0] = 0x7FFE >> 8;
-  buffer[1] = 0x7FFE & 0xff;
-#endif
   uint16_t mirror = ((uint16_t)buffer[0] << 8) | buffer[1];
 
   // Helper lambda to validate a pointer

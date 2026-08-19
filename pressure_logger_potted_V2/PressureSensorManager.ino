@@ -5,12 +5,8 @@ uint16_t last_pressure = 0;
 
 void ReadInitialPressure()
 {
-#ifndef DEBUG_NO_HARDWARE
   sensor.read();
   initial_pressure = (uint16_t)sensor.pressure();
-#else
-  initial_pressure = 1500;
-#endif
 }
 
 bool ValidatePressure()
