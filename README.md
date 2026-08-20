@@ -63,24 +63,22 @@ Responsibilities:
 ## 6. CHECK UART
 
 Purpose:  
-Determine whether the UART/USB bridge is attached.  
-Detection: RX HIGH means UART bridge connected.  
-If connected, `handle_uart_session()` is entered.  
-The processor remains awake until RX LOW indicates cable removal.  
-If not connected proceed to READ_SENSOR.
+- Determine whether the UART/USB bridge is attached.  
+- Detection: RX HIGH means UART bridge connected.  
+- If connected, `handle_uart_session()` is entered.  
+- The processor remains awake until RX LOW indicates cable removal.  
+- If not connected proceed to READ_SENSOR.
 
 ## 7. READ SENSOR 
 
 Purpose:
 - Read one pressure sample.  
-If above deployment threshold ACTIVE_DEPLOYMENT.  
-Otherwise SLEEP.  
+- If above deployment threshold ACTIVE_DEPLOYMENT.  
+- Otherwise SLEEP.  
 
-## 8. ACTIVE DEPLOYMENT 
-
-At the beginning of each deployment record a timestamp `start_new_deployment()`  
-
-Purpose:  
+## 8. ACTIVE DEPLOYMENT   
+Purpose: 
+- At the beginning of each deployment record a timestamp 'start_new_deployment()'
 Every wake:  
 - Read pressure.   
 - Validate reading.   
@@ -88,16 +86,13 @@ Every wake:
 - Sleep for deployment interval.  
 
 ## 9. SLEEP 
-Enter lowest practical power state.   
+Purpose:
+- Enter lowest practical power state.   
 Wake source:  
-RTC only.  
+- RTC only.  
 Wake interval:  
 Normally 5 seconds  
 Deployment interval 10 seconds  
-
-
-
-
 
 ## 10. Communications UART/USB bridge
 
@@ -117,16 +112,16 @@ Purpose:
 'D' PC -> Arduino "Request send the data"  
 'A' PC -> Arduino "Processed the data"  
 'L' Arduino -> PC "Waiting for 'W' to erase data or 'X' to disconnect"  
-'W' Wipe �PC -> Arduino "Erase the memory."  
+'W' Wipe PC -> Arduino "Erase the memory."  
 'E' Arduino -> PC "Memory erased" waiting for 'X'  
 'X' PC -> Arduino "Close the port and go to sleep"  
-�T� PC -> Arduino  �Sync RTC time� (future)  
+'T' PC -> Arduino  "Sync RTC time" (future)  
 'B' PC -> Arduino "Backdoor" (future)  
 
 ## 12. Data Flow
 
-`0xAA 0x55` �STX Arduino -> PC �"Start of Text" (Binary start)  
-`0x55 0xAA` �ETX Arduino -> PC �"End of Text" (Binary end)  
+`0xAA 0x55` STX Arduino -> PC "Start of Text" (Binary start)  
+`0x55 0xAA` ETX Arduino -> PC "End of Text" (Binary end)  
 CRC Arduino -> PC  
 
 ## 13. RTC Set Time
@@ -148,12 +143,12 @@ Hawaii-Aleutian Time (HAT): Standard is UTC?10:00
 `measurement_interval` = 10;	The amount of time (in seconds) between pressure measurements  
 `fram_size` = 32768;			Change if a different size FRAM is used  
 `START_THRESHOLD` = 2000;	Changes when logging begins  
-`STOP_THRESHOLD` = 1100;	Recommend, don�t change. The highest recorded high pressure in history was 1080mb. Any pressure above that is assumed to be under water.                          
+`STOP_THRESHOLD` = 1100;	Recommend, don't change. The highest recorded high pressure in history was 1080mb. Any pressure above that is assumed to be under water.                          
 
 ## 15. Connections
 
 `SDA` pin 4  
-`SCL` pin 5 �  
-`RX` pin 7 �  
-`TX` pin 6 �  
-`ADC` pin 10    R1 = 1M �R2 = 1.5M  
+`SCL` pin 5   
+`RX` pin 7      external pulldown 6.8k
+`TX` pin 6   
+`ADC` pin 10    R1 = 1M R2 = 1.5M  
