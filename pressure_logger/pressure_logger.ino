@@ -39,18 +39,28 @@ Recalculate and reload the SysTick timer so millis() stays accurate
 SysTick_Config(SystemCoreClock / 1000);  */
 
 #include <Adafruit_FRAM_I2C.h>
-#include <MS5837.h>
+#include "MS5837.h"
 #include <Wire.h>
 #include <time.h>
+#include "SerialManager.h"
+
+// Uncomment this line to add debugging prints.
+#define DEBUG_LOGGING
+#ifdef DEBUG_LOGGING
+#define SERIAL_LOG(x) Serial.println(x)
+#else
+#define SERIAL_LOG(x)
+#endif
+
 
 // Operating states states
 enum DeviceState
 {
-  CHECK_UART,
-  READ_SENSOR,
-  SHELF_MODE,
+  CHECK_UART = 0,
+  READ_SENSOR = 1,
+  SHELF_MODE = 2,
 };
-DeviceState currentState = CHECK_UART; // Start here
+DeviceState currentState = SHELF_MODE; // Start here
 
 // Global Objects
 MS5837 sensor;
@@ -64,9 +74,13 @@ const byte measure_battery = 10;          // ADC input from voltage divider for 
 // Runtime Variables
 const uint8_t UTC_OFFSET_HOURS = 7;         // * besure to set your timezone* PDT 07/10/2026
 uint32_t sleep_duration;                    // Sleep duration = standby or measurement
+#ifdef DEBUG_LOGGING
+uint32_t standby_seconds = 1;               // The amount of time (in seconds) the logger sleeps when not deployed
+#else
 uint32_t standby_seconds = 5;               // The amount of time (in seconds) the logger sleeps when not deployed
+#endif
 uint32_t measurement_interval = 10;         // The amount of time (in seconds) between pressure measurements
-uint32_t fram_size = 32768;
+//uint32_t fram_size = 32768;
 uint16_t last_pressure = 0;
 const uint16_t START_THRESHOLD = 2000;
 const uint16_t STOP_THRESHOLD = 1100;
@@ -79,24 +93,25 @@ volatile bool alarmFired = false;
 
 // Function Prototypes
 void RTC_Handler();
-void fram_erase();
-void update_pointer();
+//void fram_erase();
+//void update_pointer();
 void recover_fram_address();
 void handle_active_deployment(uint16_t initial_pressure);
 void start_new_deployment(uint16_t initial_pressure);
 void save_pressure(uint16_t pressure);
 void write_32(uint16_t address, uint32_t value);
 void write_16(uint16_t address, uint16_t value);
-void dump_data();
+//void dump_data();
 void go_to_sleep(uint32_t seconds);
-void get_battery_voltage();
+//void get_battery_voltage();
 void inject_test_data();
 bool handle_uart_session();
-uint16_t crc16_update(uint16_t crc, uint8_t data);
+//uint16_t crc16_update(uint16_t crc, uint8_t data);
 
 void setup()
 {
     delay(5000);// 5 second delay to help upload code. leave 1000 before upload of final code
+
     // --- Unexposed pin configuration ---
     pinMode(0, INPUT_PULLUP);
     pinMode(1, INPUT_PULLUP);
@@ -315,7 +330,12 @@ void setup()
   while (WDT->STATUS.bit.SYNCBUSY);
 
   // 21. Disable USB and ADC to consurve power consumption
+#ifdef DEBUG_LOGGING
+  Serial.begin(115200);
+  while(!Serial);
+#else
   USBDevice.detach();
+#endif
   ADC->CTRLA.bit.ENABLE = 0;
 
   while (ADC->STATUS.bit.SYNCBUSY);
@@ -325,12 +345,12 @@ void setup()
   // This will overwrite the memory with fake data every time it boots.
   // Delete this for production
   inject_test_data();
+
 }
 /************************************************************************************************************/
 
 void loop()
 {
-
   // WATCHDOG RESET "pet the dog"
   WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
   while (WDT->STATUS.bit.SYNCBUSY);
@@ -339,29 +359,17 @@ void loop()
   {   //start of switch
 
     /*------------------------------------------------------------------------*/
-    case CHECK_UART: 
-    {
-      if (digitalRead(RX_pin) == LOW)
+    case DeviceState::CHECK_UART: 
+      if (handle_uart_session())
       {
-          currentState = READ_SENSOR;
-          break;
+        SERIAL_LOG("Switching from CHECK_UART to READ_SENSOR");
+        currentState = DeviceState::READ_SENSOR; // Resume normal operation after UART session
       }
+      break;
 
-      delay(50);
-
-      if (digitalRead(RX_pin) != HIGH)
-      {
-          currentState = READ_SENSOR;
-          break;
-      }
-
-      handle_uart_session();
-      sleep_duration = standby_seconds;
-      currentState = SHELF_MODE;
-    }
 
     /*-------------------------------------------------------------------------*/
-    case READ_SENSOR: // Read the pressure sensor
+    case DeviceState::READ_SENSOR: // Read the pressure sensor
     {
       sensor.read();
       uint16_t initial_pressure = (uint16_t)sensor.pressure();
@@ -388,7 +396,8 @@ void loop()
       if (!valid_pressure)
       {
           sleep_duration = standby_seconds;
-          currentState = SHELF_MODE;
+          SERIAL_LOG("Switching from READ_SENSOR to SHELF_MODE due to invalid pressure reading");
+          currentState = DeviceState::SHELF_MODE;
           break;
       }
 
@@ -399,19 +408,38 @@ void loop()
           start_new_deployment(initial_pressure);
           handle_active_deployment();
       }       
+
       sleep_duration = standby_seconds;
-      currentState = SHELF_MODE;
+      SERIAL_LOG("Switching from READ_SENSOR to SHELF_MODE");
+      currentState = DeviceState::SHELF_MODE;
       break;
    }
 
     /*--------------------------------------------------------------------*/
-   case SHELF_MODE:
+   case DeviceState::SHELF_MODE:
    {
+      SERIAL_LOG("Entering SHELF_MODE for " + String(sleep_duration) + " seconds");
       go_to_sleep(sleep_duration);
-      currentState = CHECK_UART;
+      //currentState = DeviceState::CHECK_UART;
       break;
    } // end of case  
   } //end of switch
+
+  // --- UART wake detection 
+  if (currentState != DeviceState::CHECK_UART)
+  {
+    pinMode(RX_pin, INPUT_PULLDOWN);
+    delayMicroseconds(300);
+
+    if (digitalRead(RX_pin) == HIGH)
+    {
+      SERIAL_LOG("UART wake detected");
+      // Force UART session on next loop iteration
+      uartSessionState = UartSessionState::CLEAN_COMM;
+      SERIAL_LOG("Switching from " + String(currentState) + " to CHECK_UART");
+      currentState = DeviceState::CHECK_UART;
+    }
+  }
 } //end of loop
 
 /*****************************************************************************/
@@ -465,16 +493,22 @@ void go_to_sleep(uint32_t seconds)
 
   /*******Blinks LED for sleep durration***********
   ****For testing only. Delete before uploading*****/
-      digitalWrite(LED_BUILTIN, LOW);
-      delay(500);
-      digitalWrite(LED_BUILTIN, HIGH);
-
+#ifdef DEBUG_LOGGING
+  digitalWrite(LED_BUILTIN, LOW);
+  delay(100);
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(seconds * 1000 - 100);
+#else
   __DSB();
   __ISB();
   __WFI();
+#endif
+  /***********************************************/
 }
 
 /***************************************************************************************/
+//Deprecated, remove
+/*
 bool handle_uart_session() 
 {
     // Setup Hardware Serial1 port
@@ -620,6 +654,7 @@ bool handle_uart_session()
     
     return reached_stage_3;
 }
+*/
 
 /******************************************************************************/
 void handle_active_deployment(void)
@@ -749,6 +784,8 @@ void save_pressure(uint16_t pressure_value)
 }
 
 /********************************************************************/
+//Deprecated, remove
+/*
 void dump_data() 
 {
     WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
@@ -859,8 +896,11 @@ void dump_data()
     Serial1.flush();
     delay(100);
 }
+*/
 
 /******************************************************/
+//Deprecated, remove
+/*
 uint16_t crc16_update(uint16_t crc, uint8_t data)
 {
   crc = crc ^ ((uint16_t)data << 8);
@@ -879,6 +919,7 @@ uint16_t crc16_update(uint16_t crc, uint8_t data)
 
   return crc;
 }
+*/
 
 /****************************************************************************/
 void write_16(uint16_t address, uint16_t value)
@@ -903,6 +944,8 @@ void write_32(uint16_t address, uint32_t value)
   fram.write(address, buffer, 4);
 }
 /******************************************************************************/
+//Deprecated, remove
+/*
 void update_pointer()
 {
   uint8_t buffer[2];
@@ -917,6 +960,7 @@ void update_pointer()
   // 2. Write to Mirror Slot using multi-byte write
   fram.write(0x7FFE, buffer, 2);
 }
+*/
 
 /*************************************************************************************/
 
@@ -1010,6 +1054,8 @@ void recover_fram_address()
 }
 
 /****************************************************************************/
+//Deprecated, remove
+/*
 void fram_erase() 
 { 
     // 1. Execute full chip wipe (32KB @ 400kHz)
@@ -1038,8 +1084,11 @@ void fram_erase()
     Serial1.write('E'); 
     Serial1.flush();    
 }
+*/
 
 /***********************************************************************************/
+//Deprecated, remove
+/*
 void get_battery_voltage()
 {
   // Wake ADC and wait for it to wake up
@@ -1069,6 +1118,7 @@ void get_battery_voltage()
   Serial1.print(battery_voltage);
   Serial1.write('V');
 }
+*/
 
 /******************************************************************/
 // Global Hardware Interrupt Routine 
