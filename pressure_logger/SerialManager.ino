@@ -1,7 +1,6 @@
 #include "SerialManager.h"
 
 void handle_uart_session_clean_comm();
-bool handle_uart_sessaion_debounce();
 void handle_uart_session_detect_client();
 void handle_uart_session_confirm_client();
 void handle_uart_session_command_mode();
@@ -36,28 +35,23 @@ bool handle_uart_session()
       break;
     case UartSessionState::DETECT_CLIENT:
       //SERIAL_LOG("DETECT_CLIENT state");
-      if (handle_uart_sessaion_debounce())
-        handle_uart_session_detect_client();
+      handle_uart_session_detect_client();
       break;
     case UartSessionState::CONFIRM_CLIENT:
       SERIAL_LOG("CONFIRM_CLIENT state");
-      if (handle_uart_sessaion_debounce())
-        handle_uart_session_confirm_client();
+      handle_uart_session_confirm_client();
       break;
     case UartSessionState::COMMAND_MODE:
       SERIAL_LOG("COMMAND_MODE state");
-      if (handle_uart_sessaion_debounce())
-        handle_uart_session_command_mode();
+      handle_uart_session_command_mode();
       break;
     case UartSessionState::COMMAND_MODE_EXIT:
       SERIAL_LOG("COMMAND_MODE_EXIT state");
-      if (handle_uart_sessaion_debounce())
-        handle_uart_session_command_mode_exit();
+      handle_uart_session_command_mode_exit();
       break;
     case UartSessionState::CLEANUP_COMM:
       SERIAL_LOG("CLEANUP_COMM state");
-      if (handle_uart_sessaion_debounce())
-        handle_uart_session_cleanup_comm();
+      handle_uart_session_cleanup_comm();
       break;
   }
 
@@ -93,36 +87,11 @@ void handle_uart_session_clean_comm()
   uartSessionState = UartSessionState::DETECT_CLIENT;
 }
 
-bool handle_uart_sessaion_debounce()
-{
-  WDT->CLEAR.reg = WDT_CLEAR_CLEAR_KEY;
-  while (WDT->STATUS.bit.SYNCBUSY);
-
-  // 1-Second cable glitch timmer for docking/debouncing
-  if (digitalRead(RX_pin) == LOW) 
-  {
-    if (disconnect_grace_start == 0) 
-    {
-      disconnect_grace_start = millis();
-    }
-    if (millis() - disconnect_grace_start > 1000) 
-    {
-      uartSessionState = UartSessionState::CLEANUP_COMM;
-      return false;
-    }
-  } 
-  else 
-  {
-    disconnect_grace_start = 0; 
-  }
-
-  return (disconnect_grace_start == 0);
-}
-
 void handle_uart_session_detect_client()
 {
   if (millis() - handshake_timeout_start >= 2000)
   {
+    SERIAL_LOG("DETECT_CLIENT -> CLEANUP_COMM due to timeout");
     uartSessionState = UartSessionState::CLEANUP_COMM;
     return;
   }
@@ -136,6 +105,7 @@ void handle_uart_session_detect_client()
       Serial1.write('H'); // Arduino -> 'H'
       Serial1.flush();
       handshake_timeout_start = millis(); // Start 5s limit to see a 'C'
+      SERIAL_LOG("DETECT_CLIENT -> CONFIRM_CLIENT");
       uartSessionState = UartSessionState::CONFIRM_CLIENT;
     }
   }
@@ -146,6 +116,7 @@ void handle_uart_session_confirm_client()
 {
   if (millis() - handshake_timeout_start >= 5000)
   {
+    SERIAL_LOG("CONFIRM_CLIENT -> CLEANUP_COMM due to timeout");
     uartSessionState = UartSessionState::CLEANUP_COMM;
     return;
   }
@@ -159,6 +130,7 @@ void handle_uart_session_confirm_client()
     {
       get_battery_voltage();
       handshake_timeout_start = millis();
+      SERIAL_LOG("CONFIRM_CLIENT -> COMMAND_MODE");
       uartSessionState = UartSessionState::COMMAND_MODE;
     }
   }
@@ -167,6 +139,13 @@ void handle_uart_session_confirm_client()
 
 void handle_uart_session_command_mode()
 {
+  if (millis() - handshake_timeout_start >= 15000)
+  {
+    SERIAL_LOG("CONFIRM_CLIENT -> CLEANUP_COMM due to timeout");
+    uartSessionState = UartSessionState::CLEANUP_COMM;
+    return;
+  }
+
   if (Serial1.available() > 0) 
   {
     char cmd = Serial1.read(); // 
@@ -184,10 +163,14 @@ void handle_uart_session_command_mode()
       case 'A': 
         Serial1.write('L'); // Arduino -> 'L' waiting for 'X' or 'W'
         Serial1.flush();
+        SERIAL_LOG("COMMAND_MODE -> COMMAND_MODE_EXIT");
+        handshake_timeout_start = millis();
         uartSessionState = UartSessionState::COMMAND_MODE_EXIT;
         break;
 
       default: 
+        SERIAL_LOG("COMMAND_MODE -> CLEANUP_COMM due to unknown command");
+        handshake_timeout_start = millis();
         uartSessionState = UartSessionState::CLEANUP_COMM;
         break;
     }
@@ -197,6 +180,13 @@ void handle_uart_session_command_mode()
 
 void handle_uart_session_command_mode_exit()
 {
+  if (millis() - handshake_timeout_start >= 3000)
+  {
+    SERIAL_LOG("CONFIRM_CLIENT -> CLEANUP_COMM due to timeout");
+    uartSessionState = UartSessionState::CLEANUP_COMM;
+    return;
+  }
+
   if (Serial1.available() > 0) 
   {
     char cmd = Serial1.read(); // 
@@ -212,6 +202,7 @@ void handle_uart_session_command_mode_exit()
       // 6. Request disconnect of UART PC -> 'X'
       case 'X': 
       default: 
+        SERIAL_LOG("COMMAND_MODE_EXIT -> CLEANUP_COMM after 'X' or unknown command");
         uartSessionState = UartSessionState::CLEANUP_COMM;
         break;
     }
@@ -222,12 +213,13 @@ void handle_uart_session_command_mode_exit()
 void handle_uart_session_cleanup_comm()
 {
   // Shut down Serial port
-  Serial1.flush(); 
+  //Serial1.flush(); 
   Serial1.end(); 
   
   pinMode(TX_pin, INPUT_PULLDOWN);
   pinMode(RX_pin, INPUT);
 
+  SERIAL_LOG("CLEANUP_COMM -> CLEAN_COMM");
   uartSessionState = UartSessionState::CLEAN_COMM;
 }
 

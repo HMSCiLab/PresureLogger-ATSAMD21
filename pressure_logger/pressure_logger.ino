@@ -356,10 +356,12 @@ void loop()
 
     /*------------------------------------------------------------------------*/
     case DeviceState::CHECK_UART: 
+      digitalWrite(LED_BUILTIN, LOW);
       if (handle_uart_session())
       {
         SERIAL_LOG("Switching from CHECK_UART to READ_SENSOR");
         currentState = DeviceState::READ_SENSOR; // Resume normal operation after UART session
+        digitalWrite(LED_BUILTIN, HIGH);
       }
       break;
 
@@ -367,6 +369,7 @@ void loop()
     /*-------------------------------------------------------------------------*/
     case DeviceState::READ_SENSOR: // Read the pressure sensor
     {
+      SERIAL_LOG("Entering READ_SENSOR");
       sensor.read();
       uint16_t initial_pressure = (uint16_t)sensor.pressure();
 
@@ -416,7 +419,7 @@ void loop()
    {
       SERIAL_LOG("Entering SHELF_MODE for " + String(sleep_duration) + " seconds");
       go_to_sleep(sleep_duration);
-      // Stay in shelf mode until UART wakeup or next loop iteration
+      currentState = DeviceState::READ_SENSOR; // Always take a measurement after a sleep to see if we are at pressure yet.
       break;
    } // end of case  
   } //end of switch
