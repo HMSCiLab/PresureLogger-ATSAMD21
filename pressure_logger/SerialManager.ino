@@ -4,7 +4,6 @@ void handle_uart_session_clean_comm();
 void handle_uart_session_detect_client();
 void handle_uart_session_confirm_client();
 void handle_uart_session_command_mode();
-void handle_uart_session_command_mode_exit();
 void handle_uart_session_cleanup_comm();
 
 void fram_erase();
@@ -44,10 +43,6 @@ bool handle_uart_session()
     case UartSessionState::COMMAND_MODE:
       SERIAL_LOG("COMMAND_MODE state");
       handle_uart_session_command_mode();
-      break;
-    case UartSessionState::COMMAND_MODE_EXIT:
-      SERIAL_LOG("COMMAND_MODE_EXIT state");
-      handle_uart_session_command_mode_exit();
       break;
     case UartSessionState::CLEANUP_COMM:
       SERIAL_LOG("CLEANUP_COMM state");
@@ -159,40 +154,12 @@ void handle_uart_session_command_mode()
         Serial1.flush();
         break;
 
-      // 4. Acknolage received data PC -> 'A'
+      // 4. Acknowledge received data PC -> 'A'
       case 'A': 
         Serial1.write('L'); // Arduino -> 'L' waiting for 'X' or 'W'
         Serial1.flush();
-        SERIAL_LOG("COMMAND_MODE -> COMMAND_MODE_EXIT");
-        handshake_timeout_start = millis();
-        uartSessionState = UartSessionState::COMMAND_MODE_EXIT;
         break;
 
-      default: 
-        SERIAL_LOG("COMMAND_MODE -> CLEANUP_COMM due to unknown command");
-        handshake_timeout_start = millis();
-        uartSessionState = UartSessionState::CLEANUP_COMM;
-        break;
-    }
-  }
-  delay(1);
-}
-
-void handle_uart_session_command_mode_exit()
-{
-  if (millis() - handshake_timeout_start >= 3000)
-  {
-    SERIAL_LOG("CONFIRM_CLIENT -> CLEANUP_COMM due to timeout");
-    uartSessionState = UartSessionState::CLEANUP_COMM;
-    return;
-  }
-
-  if (Serial1.available() > 0) 
-  {
-    char cmd = Serial1.read(); // 
-
-    switch (cmd) 
-    {
       // 5. Request FRAM erase PC -> 'W'
       case 'W': 
         fram_erase();
@@ -201,8 +168,9 @@ void handle_uart_session_command_mode_exit()
 
       // 6. Request disconnect of UART PC -> 'X'
       case 'X': 
-      default: 
-        SERIAL_LOG("COMMAND_MODE_EXIT -> CLEANUP_COMM after 'X' or unknown command");
+      default:
+        SERIAL_LOG("COMMAND_MODE -> CLEANUP_COMM due to exit or unknown command");
+        handshake_timeout_start = millis();
         uartSessionState = UartSessionState::CLEANUP_COMM;
         break;
     }
